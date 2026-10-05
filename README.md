@@ -239,6 +239,21 @@ Guarantee: logs never contain `ADMIN_TOKEN`, `Authorization` values,
 `R2_SECRET_ACCESS_KEY`, cookie file contents, or full env — presence only
 (`set`/`missing`). yt-dlp args log the cookies *path*, never its contents.
 
+### Diagnosing `invalid JSON metadata`
+
+This error means yt-dlp **exited 0 but stdout wasn't JSON** (distinct from
+blocking, which exits non-zero). The message now carries exit code, stdout
+byte size, and head/tail excerpts — check how it reads:
+
+- `stdout 0 bytes` → yt-dlp printed nothing; retry once, then check the pin.
+- `hit output cap` → dump exceeded 5MB; the cap needs raising.
+- `Head: "WARNING: ..."` → extractor notice on stdout; usually auto-salvaged
+  (see `[meta] salvaged JSON` at debug level).
+- Otherwise the head/tail shows exactly what came back.
+
+`LOG_LEVEL=debug` adds `[meta] raw ... jsonBytes=` / `[yt-dlp] exit ...`
+lines with the same numbers while the job is running.
+
 Secrets (`ADMIN_TOKEN`, full R2 secret) are never logged; startup logs only
 show presence (`set`/`missing`) and cookie status.
 

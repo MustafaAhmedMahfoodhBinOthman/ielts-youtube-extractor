@@ -98,8 +98,9 @@ export interface YtDlpMetadata {
 function runCmd(
   cmd: string,
   args: string[],
-  timeoutMs: number
-): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+  timeoutMs: number,
+  maxBytes = 500_000
+): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; truncated: boolean }> {
   return new Promise((resolve) => {
     const started = Date.now();
     logger.debug(`[yt-dlp] spawn: ${cmd} ${args.join(" ")} timeoutMs=${timeoutMs}`);
@@ -107,29 +108,37 @@ function runCmd(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let truncated = false;
     const kill = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
     child.stdout.on("data", (d) => {
       stdout += String(d);
-      if (stdout.length > 500_000) stdout = stdout.slice(-500_000);
+      if (stdout.length > maxBytes) {
+        stdout = stdout.slice(-maxBytes);
+        truncated = true;
+      }
     });
     child.stderr.on("data", (d) => {
       stderr += String(d);
-      if (stderr.length > 500_000) stderr = stderr.slice(-500_000);
+      if (stderr.length > maxBytes) {
+        stderr = stderr.slice(-maxBytes);
+        truncated = true;
+      }
     });
     child.on("error", (err) => {
       clearTimeout(kill);
       logger.debug(`[yt-dlp] spawn error: ${cmd} elapsedMs=${Date.now() - started} err=${String(err).slice(0, 200)}`);
-      resolve({ code: 1, stdout, stderr: stderr + `\nspawn error: ${String(err)}`, timedOut });
+      resolve({ code: 1, stdout, stderr: stderr + `\nspawn error: ${String(err)}`, timedOut, truncated });
     });
     child.on("close", (code) => {
       clearTimeout(kill);
       logger.debug(
-        `[yt-dlp] exit: ${cmd} code=${code} elapsedMs=${Date.now() - started} timedOut=${timedOut} stdoutBytes=${stdout.length} stderrBytes=${stderr.length}`
+        `[yt-dlp] exit: ${cmd} code=${code} elapsedMs=${Date.now() - started} timedOut=${timedOut} ` +
+          `stdoutBytes=${stdout.length} stderrBytes=${stderr.length} truncated=${truncated}`
       );
-      resolve({ code, stdout, stderr, timedOut });
+      resolve({ code, stdout, stderr, timedOut, truncated });
     });
   });
 }
@@ -153,6 +162,49 @@ export function isTooLargeOutput(text: string): boolean {
   return t.includes("larger than max-filesize") || t.includes("max-filesize") || t.includes("file is larger than");
 }
 
+function tryParseJsonObject(s: string): Record<string, unknown> | null {
+  try {
+    const v = JSON.parse(s) as unknown;
+    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse `yt-dlp --dump-single-json` output. stdout occasionally carries
+ * non-JSON prefix/suffix lines (extractor notices despite --no-warnings);
+ * salvage by trimming to the outer { ... } when the raw parse fails.
+ * On total failure throw an error carrying byte counts + head/tail excerpts
+ * so production logs (even at info level) show exactly what yt-dlp returned.
+ */
+function parseMetadataJson(stdout: string, stderr: string, truncated: boolean): Record<string, unknown> {
+  const direct = tryParseJsonObject(stdout);
+  if (direct) return direct;
+  const start = stdout.indexOf("{");
+  const end = stdout.lastIndexOf("}");
+  if (start >= 0 && end > start && (start > 0 || end < stdout.length - 1)) {
+    const salvaged = tryParseJsonObject(stdout.slice(start, end + 1));
+    if (salvaged) {
+      logger.debug(`[meta] salvaged JSON: stripped ${start} leading bytes of ${stdout.length}`);
+      return salvaged;
+    }
+  }
+  const head = stdout.slice(0, 400);
+  const tail = stdout.slice(-400);
+  const stderrTail = stderr.slice(-400).trim();
+  throw new Error(
+    `yt-dlp returned invalid JSON metadata (exit 0, stdout ${stdout.length} bytes` +
+      `${truncated ? ", hit output cap — likely truncated" : ""}). ` +
+      `Head: ${JSON.stringify(head)} Tail: ${JSON.stringify(tail)}` +
+      (stderrTail ? ` Stderr tail: ${JSON.stringify(stderrTail)}` : " (stderr empty)") +
+      (stdout.length === 0
+        ? " Hint: empty stdout with exit 0 — possible output redirect or yt-dlp crash; retry, then check the Dockerfile yt-dlp pin."
+        : "")
+  );
+}
+
 export async function getYtDlpMetadata(
   canonicalUrl: string,
   cookiesFile: string | null,
@@ -163,20 +215,20 @@ export async function getYtDlpMetadata(
   args.push(canonicalUrl);
   logger.debug(`[meta] fetch url=${canonicalUrl} cookies=${cookiesFile ? "yes(path only)" : "no"}`);
   const started = Date.now();
-  const { code, stdout, stderr, timedOut } = await runCmd("yt-dlp", args, timeoutMs);
-  logger.debug(`[meta] raw elapsedMs=${Date.now() - started} code=${code} timedOut=${timedOut} jsonBytes=${stdout.length}`);
+  // Metadata dumps (formats, thumbnails, subtitles, chapters, heatmap) can
+  // run to several MB. Keep up to 5MB: 2 concurrent jobs x 5MB is fine.
+  const { code, stdout, stderr, timedOut, truncated } = await runCmd("yt-dlp", args, timeoutMs, 5_000_000);
+  logger.debug(
+    `[meta] raw elapsedMs=${Date.now() - started} code=${code} timedOut=${timedOut} ` +
+      `jsonBytes=${stdout.length} truncated=${truncated}`
+  );
   const combined = `${stdout}\n${stderr}`;
   if (timedOut) throw new TimeoutError("metadata fetch timed out");
   if (code !== 0) {
     if (isBlockedOutput(combined)) throw new BlockedError();
     throw new Error(`yt-dlp metadata failed: ${stderr.slice(-2000) || stdout.slice(-2000) || `exit ${code}`}`);
   }
-  let json: Record<string, unknown>;
-  try {
-    json = JSON.parse(stdout) as Record<string, unknown>;
-  } catch {
-    throw new Error("yt-dlp returned invalid JSON metadata");
-  }
+  const json = parseMetadataJson(stdout, stderr, truncated);
   const duration =
     typeof json["duration"] === "number" && Number.isFinite(json["duration"])
       ? (json["duration"] as number)

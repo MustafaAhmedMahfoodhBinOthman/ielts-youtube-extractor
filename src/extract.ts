@@ -482,10 +482,12 @@ export async function runYtDlpVideoExtract(
   // unexpected stream must never ship as "h264" — several cheap video models
   // reject VP9/AV1 outright and the failure surfaces at the provider with no
   // useful context. Fail here, where the cause is obvious.
+  // ffprobe reports H.264 as codec_name "h264" ("avc1" is the container
+  // fourcc), so accept either spelling.
   const codecs = await probeVideoCodec(filepath);
-  if (codecs.video && !/^avc1$/i.test(codecs.video)) {
+  if (codecs.video && !/^(h264|avc1)$/i.test(codecs.video)) {
     throw new VideoMergeError(
-      `Expected H.264 (avc1) video for model compatibility but got "${codecs.video}". ` +
+      `Expected H.264 video for model compatibility but got "${codecs.video}". ` +
         `VP9/AV1 are rejected by several video models.`
     );
   }

@@ -115,7 +115,7 @@ Accepted URL forms: `youtube.com/watch?v=ID`, `youtube.com/shorts/ID`,
 
 Pipeline:
 
-1. oEmbed title/author + `yt-dlp --dump-single-json --no-playlist` metadata.
+1. oEmbed title/author + `yt-dlp --print` metadata (8 fields, bounded output).
    Rejects live / private / age-restricted / `duration > 3600s` with 400 `rejected`.
 2. Max 2 concurrent extractions; extras get 429 `{success:false,code:"busy_retry"}`.
 3. `yt-dlp -f bestaudio/best -x --audio-format mp3 --audio-quality 128K --no-playlist --max-filesize 100M`
@@ -239,20 +239,17 @@ Guarantee: logs never contain `ADMIN_TOKEN`, `Authorization` values,
 `R2_SECRET_ACCESS_KEY`, cookie file contents, or full env — presence only
 (`set`/`missing`). yt-dlp args log the cookies *path*, never its contents.
 
-### Diagnosing `invalid JSON metadata`
+### Diagnosing metadata failures
 
-This error means yt-dlp **exited 0 but stdout wasn't JSON** (distinct from
-blocking, which exits non-zero). The message now carries exit code, stdout
-byte size, and head/tail excerpts — check how it reads:
+Metadata comes from `yt-dlp --print` (8 short lines: title, duration,
+is_live, live_status, availability, age_limit, uploader, channel) — never a
+full JSON dump, so caption/format-heavy videos can't break parsing by size.
+`LOG_LEVEL=debug` adds `[meta] raw ... stdoutBytes=` lines per job.
 
-- `stdout 0 bytes` → yt-dlp printed nothing; retry once, then check the pin.
-- `hit output cap` → dump exceeded 5MB; the cap needs raising.
-- `Head: "WARNING: ..."` → extractor notice on stdout; usually auto-salvaged
-  (see `[meta] salvaged JSON` at debug level).
-- Otherwise the head/tail shows exactly what came back.
-
-`LOG_LEVEL=debug` adds `[meta] raw ... jsonBytes=` / `[yt-dlp] exit ...`
-lines with the same numbers while the job is running.
+- `returned N lines, expected 8` → yt-dlp printed something unexpected;
+  the error carries the raw output excerpt + stderr tail.
+- `metadata failed: ...` (non-zero exit) → see exit code / stderr tail;
+  `blocked_429` means refresh `YTDLP_COOKIES_B64` or bump the pinned yt-dlp.
 
 Secrets (`ADMIN_TOKEN`, full R2 secret) are never logged; startup logs only
 show presence (`set`/`missing`) and cookie status.

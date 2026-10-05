@@ -162,47 +162,69 @@ export function isTooLargeOutput(text: string): boolean {
   return t.includes("larger than max-filesize") || t.includes("max-filesize") || t.includes("file is larger than");
 }
 
-function tryParseJsonObject(s: string): Record<string, unknown> | null {
-  try {
-    const v = JSON.parse(s) as unknown;
-    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
-    return null;
-  } catch {
-    return null;
-  }
+/** Field order for the `--print` metadata fetch. Must match the args below. */
+const META_PRINT_ORDER = [
+  "title",
+  "duration",
+  "is_live",
+  "live_status",
+  "availability",
+  "age_limit",
+  "uploader",
+  "channel",
+] as const;
+
+function nullIfNA(v: string): string | null {
+  return v === "NA" ? null : v;
+}
+
+function numberIfPresent(v: string): number | null {
+  if (v === "NA") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
- * Parse `yt-dlp --dump-single-json` output. stdout occasionally carries
- * non-JSON prefix/suffix lines (extractor notices despite --no-warnings);
- * salvage by trimming to the outer { ... } when the raw parse fails.
- * On total failure throw an error carrying byte counts + head/tail excerpts
- * so production logs (even at info level) show exactly what yt-dlp returned.
+ * Parse the 8-line `--print` metadata output in field order. Only `title`
+ * is free text and may itself contain newlines: surplus lines are folded
+ * back into it, the last 7 lines are always the scalar fields.
+ * Throws a detailed error (byte counts + excerpt) when the shape is wrong.
  */
-function parseMetadataJson(stdout: string, stderr: string, truncated: boolean): Record<string, unknown> {
-  const direct = tryParseJsonObject(stdout);
-  if (direct) return direct;
-  const start = stdout.indexOf("{");
-  const end = stdout.lastIndexOf("}");
-  if (start >= 0 && end > start && (start > 0 || end < stdout.length - 1)) {
-    const salvaged = tryParseJsonObject(stdout.slice(start, end + 1));
-    if (salvaged) {
-      logger.debug(`[meta] salvaged JSON: stripped ${start} leading bytes of ${stdout.length}`);
-      return salvaged;
-    }
+export function parseMetadataPrint(stdout: string, stderr: string): YtDlpMetadata {
+  const rawLines = stdout.split(/\r?\n/);
+  if (rawLines.length > 0 && rawLines[rawLines.length - 1] === "") rawLines.pop();
+  if (rawLines.length < META_PRINT_ORDER.length) {
+    const tail = stderr.slice(-400).trim();
+    throw new Error(
+      `yt-dlp metadata print returned ${rawLines.length} lines, expected ${META_PRINT_ORDER.length} ` +
+        `(stdout ${stdout.length} bytes). Output: ${JSON.stringify(stdout.slice(0, 500))}` +
+        (tail ? ` Stderr tail: ${JSON.stringify(tail)}` : " (stderr empty)")
+    );
   }
-  const head = stdout.slice(0, 400);
-  const tail = stdout.slice(-400);
-  const stderrTail = stderr.slice(-400).trim();
-  throw new Error(
-    `yt-dlp returned invalid JSON metadata (exit 0, stdout ${stdout.length} bytes` +
-      `${truncated ? ", hit output cap — likely truncated" : ""}). ` +
-      `Head: ${JSON.stringify(head)} Tail: ${JSON.stringify(tail)}` +
-      (stderrTail ? ` Stderr tail: ${JSON.stringify(stderrTail)}` : " (stderr empty)") +
-      (stdout.length === 0
-        ? " Hint: empty stdout with exit 0 — possible output redirect or yt-dlp crash; retry, then check the Dockerfile yt-dlp pin."
-        : "")
-  );
+  const scalar = rawLines.slice(-7);
+  const titleRaw = rawLines.slice(0, rawLines.length - 7).join("\n");
+  const [durationRaw, isLiveRaw, liveStatusRaw, availabilityRaw, ageLimitRaw, uploaderRaw, channelRaw] = scalar as [
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+  ];
+  if (rawLines.length > META_PRINT_ORDER.length) {
+    logger.debug(`[meta] folded ${rawLines.length - META_PRINT_ORDER.length} extra newline(s) into title`);
+  }
+  const uploader = nullIfNA(uploaderRaw);
+  return {
+    title: titleRaw === "NA" || titleRaw === "" ? null : titleRaw,
+    duration: numberIfPresent(durationRaw),
+    isLive: isLiveRaw === "True",
+    liveStatus: nullIfNA(liveStatusRaw),
+    availability: nullIfNA(availabilityRaw),
+    ageLimit: ageLimitRaw === "NA" ? 0 : (numberIfPresent(ageLimitRaw) ?? 0),
+    uploader: uploader ?? nullIfNA(channelRaw),
+  };
 }
 
 export async function getYtDlpMetadata(
@@ -210,17 +232,39 @@ export async function getYtDlpMetadata(
   cookiesFile: string | null,
   timeoutMs = 60_000
 ): Promise<YtDlpMetadata> {
-  const args = ["--dump-single-json", "--no-playlist", "--no-warnings", "--socket-timeout", "15"];
+  // Field printing instead of --dump-single-json: caption/format-heavy
+  // videos produce multi-MB dumps that break JSON parsing. Output size here
+  // is bounded (~8 short lines) regardless of video. Order must match
+  // META_PRINT_ORDER.
+  const args = [
+    "--no-playlist",
+    "--no-warnings",
+    "--socket-timeout",
+    "15",
+    "--print",
+    "%(title)s",
+    "--print",
+    "%(duration)s",
+    "--print",
+    "%(is_live)s",
+    "--print",
+    "%(live_status)s",
+    "--print",
+    "%(availability)s",
+    "--print",
+    "%(age_limit)s",
+    "--print",
+    "%(uploader)s",
+    "--print",
+    "%(channel)s",
+  ];
   if (cookiesFile) args.push("--cookies", cookiesFile);
   args.push(canonicalUrl);
   logger.debug(`[meta] fetch url=${canonicalUrl} cookies=${cookiesFile ? "yes(path only)" : "no"}`);
   const started = Date.now();
-  // Metadata dumps (formats, thumbnails, subtitles, chapters, heatmap) can
-  // run to several MB. Keep up to 5MB: 2 concurrent jobs x 5MB is fine.
-  const { code, stdout, stderr, timedOut, truncated } = await runCmd("yt-dlp", args, timeoutMs, 5_000_000);
+  const { code, stdout, stderr, timedOut } = await runCmd("yt-dlp", args, timeoutMs);
   logger.debug(
-    `[meta] raw elapsedMs=${Date.now() - started} code=${code} timedOut=${timedOut} ` +
-      `jsonBytes=${stdout.length} truncated=${truncated}`
+    `[meta] raw elapsedMs=${Date.now() - started} code=${code} timedOut=${timedOut} stdoutBytes=${stdout.length}`
   );
   const combined = `${stdout}\n${stderr}`;
   if (timedOut) throw new TimeoutError("metadata fetch timed out");
@@ -228,25 +272,7 @@ export async function getYtDlpMetadata(
     if (isBlockedOutput(combined)) throw new BlockedError();
     throw new Error(`yt-dlp metadata failed: ${stderr.slice(-2000) || stdout.slice(-2000) || `exit ${code}`}`);
   }
-  const json = parseMetadataJson(stdout, stderr, truncated);
-  const duration =
-    typeof json["duration"] === "number" && Number.isFinite(json["duration"])
-      ? (json["duration"] as number)
-      : null;
-  const meta: YtDlpMetadata = {
-    title: typeof json["title"] === "string" ? (json["title"] as string) : null,
-    duration,
-    isLive: json["is_live"] === true,
-    liveStatus: typeof json["live_status"] === "string" ? (json["live_status"] as string) : null,
-    availability: typeof json["availability"] === "string" ? (json["availability"] as string) : null,
-    ageLimit: typeof json["age_limit"] === "number" ? (json["age_limit"] as number) : 0,
-    uploader:
-      typeof json["uploader"] === "string"
-        ? (json["uploader"] as string)
-        : typeof json["channel"] === "string"
-          ? (json["channel"] as string)
-          : null,
-  };
+  const meta = parseMetadataPrint(stdout, stderr);
   logger.debug(
     `[meta] parsed duration=${meta.duration} isLive=${meta.isLive} liveStatus=${meta.liveStatus} ` +
       `availability=${meta.availability} ageLimit=${meta.ageLimit} uploader=${meta.uploader ?? "null"} ` +

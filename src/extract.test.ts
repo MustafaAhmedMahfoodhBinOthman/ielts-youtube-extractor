@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertMetadataAllowed, parseMetadataPrint } from "./extract.js";
+import { assertMetadataAllowed, buildExtractArgs, parseMetadataPrint } from "./extract.js";
 import { RejectedError } from "./extract.js";
 
 const NORMAL = [
@@ -71,5 +71,28 @@ describe("parseMetadataPrint", () => {
     const m = parseMetadataPrint(["T", "abc", "False", "NA", "public", "xyz", "U", "C"].join("\n") + "\n", "");
     expect(m.duration).toBeNull();
     expect(m.ageLimit).toBe(0);
+  });
+});
+
+describe("buildExtractArgs", () => {
+  const BASE = ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "128K"];
+
+  it("adds accurate section-cut flags when trimming", () => {
+    const args = buildExtractArgs("https://www.youtube.com/watch?v=x", "/tmp/yt-j/%(id)s.%(ext)s", null, "*0:00:30-0:10:00");
+    for (const flag of BASE) expect(args).toContain(flag);
+    const i = args.indexOf("--download-sections");
+    expect(i).toBeGreaterThan(-1);
+    expect(args[i + 1]).toBe("*0:00:30-0:10:00");
+    // Exact cuts: without this, yt-dlp seeks to the nearest seek point and
+    // audio before start_time leaks into the mp3.
+    expect(args).toContain("--force-keyframes-at-cuts");
+  });
+
+  it("omits section flags when not trimming and keeps cookies", () => {
+    const args = buildExtractArgs("url", "tmpl", "/tmp/cookies.txt", null);
+    expect(args).not.toContain("--download-sections");
+    expect(args).not.toContain("--force-keyframes-at-cuts");
+    expect(args).toContain("--cookies");
+    expect(args.slice(-3)).toEqual(["-o", "tmpl", "url"]);
   });
 });

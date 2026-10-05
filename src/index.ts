@@ -24,6 +24,13 @@ import {
 import { tryRun } from "./queue.js";
 import { uploadToR2 } from "./r2.js";
 import { LOG_LEVEL, logger } from "./logger.js";
+import {
+  InvalidRangeError,
+  ParsedRange,
+  assertRangeWithinDuration,
+  buildSectionArg,
+  parseTimeRange,
+} from "./range.js";
 
 const PORT = Number(process.env.PORT || "3000");
 
@@ -122,9 +129,12 @@ function authMiddleware(req: express.Request, res: express.Response, next: expre
 }
 
 // --- validation ---
+const TimeInput = z.union([z.number(), z.string().min(1).max(32)]);
 const ExtractBody = z.object({
   youtube_url: z.string().min(1).max(2000),
   title_hint: z.string().min(1).max(200).optional(),
+  start_time: TimeInput.optional(),
+  end_time: TimeInput.optional(),
 });
 
 function redactUrlForLog(canonicalUrl: string): string {
@@ -201,6 +211,10 @@ interface JobResult {
   title: string;
   duration_seconds: number | null;
   size: number;
+  trimmed: boolean;
+  start_seconds: number | null;
+  end_seconds: number | null;
+  original_duration_seconds: number | null;
 }
 
 interface JobError {
@@ -233,6 +247,9 @@ function scheduleJobCleanup(jobId: string): void {
 }
 
 function toJobError(err: unknown): { status: number; body: JobError } {
+  if (err instanceof InvalidRangeError) {
+    return { status: err.status, body: { code: err.code, error: err.message } };
+  }
   if (err instanceof RejectedError) {
     return { status: err.status, body: { code: err.code, error: err.reason } };
   }
@@ -268,9 +285,11 @@ async function runExtraction(
   jobId: string,
   videoId: string,
   canonicalUrl: string,
-  title_hint: string | undefined
+  title_hint: string | undefined,
+  range: ParsedRange
 ): Promise<JobResult> {
   const jobStarted = Date.now();
+  const trimming = range.startSeconds > 0 || range.endSeconds !== null;
   const tmpDir = path.join(os.tmpdir(), `yt-${jobId}`);
   await fs.mkdir(tmpDir, { recursive: true });
   logger.debug(`[job ${jobId}] tmp ready dir=${tmpDir}`);
@@ -283,12 +302,17 @@ async function runExtraction(
     assertMetadataAllowed(meta);
     logger.debug(`[job ${jobId}] stage=allowed duration=${meta.duration}`);
 
+    assertRangeWithinDuration(range, meta.duration, videoId);
+
     const title = (oembed.title || meta.title || title_hint || videoId).trim().slice(0, 200) || videoId;
     logger.debug(`[job ${jobId}] stage=title len=${title.length} hint=${title_hint ? `yes(${title_hint.length}ch)` : "no"}`);
 
+    // Trim at fetch time (Option A): yt-dlp downloads only the section.
+    const sectionArg = buildSectionArg(range);
+    logger.debug(`[job ${jobId}] stage=sections trimming=${trimming} arg=${sectionArg ?? "none"}`);
     // Extract mp3 (240s timeout inside)
     const tExtract = Date.now();
-    const { filepath } = await runYtDlpExtract(canonicalUrl, tmpDir, cookiesFile);
+    const { filepath } = await runYtDlpExtract(canonicalUrl, tmpDir, cookiesFile, undefined, sectionArg);
     logger.debug(`[job ${jobId}] stage=extract elapsedMs=${Date.now() - tExtract} file=${filepath}`);
 
     // Verify: exists, size, ffprobe duration
@@ -303,6 +327,26 @@ async function runExtraction(
     if (info.sizeBytes < 10_000) {
       throw new Error(`Extracted file suspiciously small (${info.sizeBytes} bytes) — likely failed download`);
     }
+    // Trim check: probed duration must match the requested section (±5s).
+    // Never silently upload the wrong (untrimmed) file.
+    const expectedTrimmed =
+      range.endSeconds !== null
+        ? range.endSeconds - range.startSeconds
+        : meta.duration != null
+          ? meta.duration - range.startSeconds
+          : null;
+    if (trimming && expectedTrimmed !== null && info.durationSeconds != null) {
+      const drift = Math.abs(info.durationSeconds - expectedTrimmed);
+      logger.debug(
+        `[job ${jobId}] stage=trim-check probed=${info.durationSeconds} expected=${expectedTrimmed} drift=${drift}`
+      );
+      if (drift > 5) {
+        throw new Error(
+          `Trimmed audio is ${Math.round(info.durationSeconds)}s but expected ${Math.round(expectedTrimmed)}s (±5s) ` +
+            `for range ${range.startSeconds}s-${range.endSeconds !== null ? `${range.endSeconds}s` : "end"} — refusing to upload`
+        );
+      }
+    }
 
     // Prefer title_hint for the filename slug when provided, fall back to resolved title
     const slugBase = (title_hint && title_hint.trim()) || title;
@@ -314,7 +358,7 @@ async function runExtraction(
     const { r2Key, audioUrl } = await uploadToR2(filepath, filename);
     logger.debug(`[job ${jobId}] stage=upload elapsedMs=${Date.now() - tUpload} r2Key=${r2Key}`);
 
-    const result = {
+    const result: JobResult = {
       audio_url: audioUrl,
       r2Key,
       youtube_id: videoId,
@@ -326,6 +370,10 @@ async function runExtraction(
             ? Math.round(meta.duration)
             : null,
       size: info.sizeBytes,
+      trimmed: trimming,
+      start_seconds: trimming ? range.startSeconds : null,
+      end_seconds: trimming ? range.endSeconds : null,
+      original_duration_seconds: meta.duration != null ? Math.round(meta.duration) : null,
     };
     logger.debug(`[job ${jobId}] stage=result totalElapsedMs=${Date.now() - jobStarted} size=${result.size}`);
     return result;
@@ -341,7 +389,14 @@ async function runExtraction(
 }
 
 function parseExtractInput(body: unknown):
-  | { ok: true; videoId: string; canonicalUrl: string; title_hint?: string }
+  | {
+      ok: true;
+      videoId: string;
+      canonicalUrl: string;
+      title_hint?: string;
+      start_time?: number | string;
+      end_time?: number | string;
+    }
   | { ok: false; status: number; body: Record<string, unknown> } {
   const parsed = ExtractBody.safeParse(body);
   if (!parsed.success) {
@@ -351,14 +406,21 @@ function parseExtractInput(body: unknown):
       body: {
         success: false,
         code: "invalid_url",
-        error: "Body must be { youtube_url: string, title_hint?: string }",
+        error: "Body must be { youtube_url: string, title_hint?: string, start_time?: seconds|mm:ss|hh:mm:ss, end_time?: ... }",
         details: parsed.error.issues.map((i) => ({ path: i.path, message: i.message })).slice(0, 5),
       },
     };
   }
   try {
     const p = parseYoutubeUrl(parsed.data.youtube_url);
-    return { ok: true, videoId: p.videoId, canonicalUrl: p.canonicalUrl, title_hint: parsed.data.title_hint };
+    return {
+      ok: true,
+      videoId: p.videoId,
+      canonicalUrl: p.canonicalUrl,
+      title_hint: parsed.data.title_hint,
+      start_time: parsed.data.start_time,
+      end_time: parsed.data.end_time,
+    };
   } catch (err) {
     const message = err instanceof InvalidUrlError ? err.message : "Invalid YouTube URL";
     return { ok: false, status: 400, body: { success: false, code: "invalid_url", error: message } };
@@ -376,6 +438,17 @@ app.post("/extract", authMiddleware, async (req, res) => {
   }
   const { videoId, canonicalUrl, title_hint } = input;
   logger.debug(`[extract] input videoId=${videoId} hint=${title_hint ? "yes" : "no"}`);
+  let range: ParsedRange;
+  try {
+    range = parseTimeRange(input.start_time, input.end_time);
+  } catch (err) {
+    if (err instanceof InvalidRangeError) {
+      logger.debug(`[extract] reject range: ${err.message}`);
+      res.status(err.status).json({ success: false, code: err.code, error: err.message });
+      return;
+    }
+    throw err;
+  }
   const wait = req.query.wait === "true";
   logger.debug(`[extract] mode=${wait ? "sync(wait=true)" : "async"} videoId=${videoId}`);
 
@@ -384,7 +457,7 @@ app.post("/extract", authMiddleware, async (req, res) => {
     const jobId = uuidv4();
     logger.info(`[job ${jobId}] sync start ${redactUrlForLog(canonicalUrl)}`);
     // Atomic admission (no await between busy-check and dispatch — see queue.ts).
-    const p = tryRun(() => runExtraction(jobId, videoId, canonicalUrl, title_hint));
+    const p = tryRun(() => runExtraction(jobId, videoId, canonicalUrl, title_hint, range));
     if (!p) {
       logger.debug(`[job ${jobId}] sync reject busy videoId=${videoId}`);
       res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
@@ -417,7 +490,7 @@ app.post("/extract", authMiddleware, async (req, res) => {
     job.status = "running";
     logger.info(`[job ${job.id}] start ${redactUrlForLog(canonicalUrl)}`);
     try {
-      const result = await runExtraction(job.id, videoId, canonicalUrl, title_hint);
+      const result = await runExtraction(job.id, videoId, canonicalUrl, title_hint, range);
       job.status = "done";
       job.result = result;
       logger.info(`[job ${job.id}] done ${videoId} -> ${result.r2Key} (${result.size} bytes)`);

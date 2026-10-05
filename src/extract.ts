@@ -309,13 +309,20 @@ export function assertMetadataAllowed(meta: YtDlpMetadata): void {
  * Run the audio extraction. Returns the absolute mp3 path on success.
  * Throws BlockedError / TooLargeError / TimeoutError / Error.
  */
-export async function runYtDlpExtract(
+/**
+ * Build the yt-dlp audio-extraction argv (pure — unit tested).
+ * When trimming, sections cut at fetch time; `--force-keyframes-at-cuts`
+ * re-encodes around the boundaries so the cut is exact. Without it yt-dlp
+ * seeks to the nearest seek point and audio before start_time leaks in —
+ * duration alone can't catch that. Still a single yt-dlp call, no extra
+ * ffmpeg step in our code.
+ */
+export function buildExtractArgs(
   canonicalUrl: string,
-  tmpDir: string,
+  outTemplate: string,
   cookiesFile: string | null,
-  timeoutMs = YTDLP_EXTRACT_TIMEOUT_MS
-): Promise<{ filepath: string; stdout: string; stderr: string }> {
-  const outTemplate = `${tmpDir}/%(id)s.%(ext)s`;
+  sectionArg: string | null
+): string[] {
   const args = [
     "-f",
     "bestaudio/best",
@@ -329,10 +336,27 @@ export async function runYtDlpExtract(
     "100M",
     "--no-warnings",
   ];
+  if (sectionArg) {
+    args.push("--download-sections", sectionArg, "--force-keyframes-at-cuts");
+  }
   if (cookiesFile) args.push("--cookies", cookiesFile);
   args.push("-o", outTemplate, canonicalUrl);
+  return args;
+}
 
-  logger.debug(`[extract] start url=${canonicalUrl} tmpDir=${tmpDir} cookies=${cookiesFile ? "yes(path only)" : "no"}`);
+export async function runYtDlpExtract(
+  canonicalUrl: string,
+  tmpDir: string,
+  cookiesFile: string | null,
+  timeoutMs = YTDLP_EXTRACT_TIMEOUT_MS,
+  sectionArg: string | null = null
+): Promise<{ filepath: string; stdout: string; stderr: string }> {
+  const outTemplate = `${tmpDir}/%(id)s.%(ext)s`;
+  const args = buildExtractArgs(canonicalUrl, outTemplate, cookiesFile, sectionArg);
+
+  logger.debug(
+    `[extract] start url=${canonicalUrl} tmpDir=${tmpDir} cookies=${cookiesFile ? "yes(path only)" : "no"} sections=${sectionArg ?? "none"}`
+  );
   const started = Date.now();
   const { code, stdout, stderr, timedOut } = await runCmd("yt-dlp", args, timeoutMs);
   logger.debug(`[extract] yt-dlp done code=${code} timedOut=${timedOut} elapsedMs=${Date.now() - started}`);

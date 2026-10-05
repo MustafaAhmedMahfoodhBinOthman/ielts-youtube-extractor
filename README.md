@@ -107,8 +107,20 @@ curl -s -m 300 -X POST 'http://localhost:3000/extract?wait=true' \
 Body:
 
 ```json
-{ "youtube_url": "https://www.youtube.com/watch?v=...", "title_hint": "optional-short-title" }
+{
+  "youtube_url": "https://www.youtube.com/watch?v=...",
+  "title_hint": "optional-short-title",
+  "start_time": "1:00",
+  "end_time": "8:24"
+}
 ```
+
+`start_time`/`end_time` are optional (seconds number/string or
+`mm:ss` / `hh:mm:ss`). Defaults: start `0`, end omitted = full audio
+(backward compatible). Trimming downloads only the section via
+`yt-dlp --download-sections` — no post-download ffmpeg step. Cuts are exact
+(`--force-keyframes-at-cuts` re-encodes around boundaries, so trimmed
+downloads are slower than full-audio ones).
 
 Accepted URL forms: `youtube.com/watch?v=ID`, `youtube.com/shorts/ID`,
 `youtube.com/embed/ID`, `youtu.be/ID` (11-char ID, else 400 `invalid_url`).
@@ -136,10 +148,49 @@ Success (200):
   "r2Key": "predictions/slug-VIDEOID-123.mp3",
   "youtube_id": "VIDEOID",
   "title": "IELTS Listening ...",
-  "duration_seconds": 1423,
-  "size": 12345678
+  "duration_seconds": 474,
+  "size": 4567890,
+  "trimmed": true,
+  "start_seconds": 30,
+  "end_seconds": 504,
+  "original_duration_seconds": 1823
 }
 ```
+
+(`trimmed:false` → `start_seconds`/`end_seconds` are null; `duration_seconds`
+is the uploaded file's probed length, `original_duration_seconds` the full video.)
+
+### Trimming
+
+```bash
+# first 8:24 of the video
+curl -s -X POST http://localhost:3000/extract \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"youtube_url":"https://www.youtube.com/watch?v=VIDEOID","end_time":"8:24"}'
+
+# 0:30 -> 10:00 (mixed seconds number + mm:ss string)
+curl -s -X POST http://localhost:3000/extract \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"youtube_url":"https://www.youtube.com/watch?v=VIDEOID","start_time":30,"end_time":"10:00"}'
+
+# end beyond the video -> invalid_range with the real duration.
+# Sync (?wait=true) fails fast with an immediate HTTP 400:
+curl -s -X POST 'http://localhost:3000/extract?wait=true' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"youtube_url":"https://www.youtube.com/watch?v=VIDEOID","end_time":"99:99:99"}'
+# -> 400 {success:false,code:"invalid_range",error:"end_time ... exceeds video duration ...s"}
+# Default async instead returns 202, then the job reports it:
+# GET /job/<id> -> {status:"failed",error:{code:"invalid_range",...}}
+
+# malformed range -> 400 invalid_range
+curl -s -X POST http://localhost:3000/extract \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"youtube_url":"https://www.youtube.com/watch?v=VIDEOID","start_time":60,"end_time":30}'
+# -> 400 {success:false,code:"invalid_range",error:"end_time (30s) must be greater than start_time (60s)"}
+```
+
+The service verifies the trimmed mp3 (`ffprobe` ≈ `end - start`, ±5s) and
+refuses to upload on mismatch — never silently the wrong file.
 
 ```bash
 # health
@@ -185,6 +236,7 @@ via `POST /extract`, poll `GET /job/:id` until `done`/`failed`.
 | 401 | `unauthorized` | missing/wrong Bearer token |
 | 400 | `invalid_url` | host/path/ID not an accepted YouTube form, or bad body |
 | 400 | `rejected` | live / private / age-restricted / >60min |
+| 400 | `invalid_range` | bad trim range (negative, `end<=start`, immediate 400) or range outside video duration (async: via failed job; `?wait=true`: immediate 400) |
 | 429 | `busy_retry` | 2 jobs already running — retry shortly |
 | 404 | `not_found` | unknown/expired `GET /job/:id` |
 | 403 | `forbidden` | browser cross-origin request, origin not allowlisted (see CORS) |
@@ -208,6 +260,8 @@ admin UI origin when the panel calls this service from a browser.
 ```bash
 npm test   # vitest: validate.test.ts (URL forms, slugs, filenames)
            # + queue.test.ts (admission gate: 5 parallel -> 2 run, 3 get 429)
+           # + range.test.ts (time parsing, H:MM:SS, duration bounds, sections)
+           # + extract.test.ts (--print metadata parser, NA variants)
 ```
 
 ## Logging

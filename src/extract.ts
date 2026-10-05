@@ -6,6 +6,8 @@ import { logger } from "./logger.js";
 export const MAX_DURATION_SECONDS = 3600; // 60 min
 export const MAX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
 /** Video mode: 720p mp4 runs bigger than 128kbps mp3, so it gets its own cap. */
+/** Video mode: 480p mp4 keeps tokens/size down while staying legible. */
+export const DEFAULT_VIDEO_MAX_HEIGHT = 480;
 export const MAX_VIDEO_FILE_BYTES = 300 * 1024 * 1024; // 300MB
 export const YTDLP_EXTRACT_TIMEOUT_MS = 240_000; // 240s
 /** Video mode needs longer than audio (bigger download + ffmpeg merge). */
@@ -328,11 +330,12 @@ export function assertMetadataAllowed(meta: YtDlpMetadata): void {
  */
 /**
  * Build the yt-dlp audio-extraction argv (pure — unit tested).
- * When trimming, sections cut at fetch time; `--force-keyframes-at-cuts`
- * re-encodes around the boundaries so the cut is exact. Without it yt-dlp
- * seeks to the nearest seek point and audio before start_time leaks in —
- * duration alone can't catch that. Still a single yt-dlp call, no extra
- * ffmpeg step in our code.
+ * Trimming requires the ffmpeg downloader: yt-dlp aborts with
+ * "This format cannot be partially downloaded" for section requests on
+ * the native HTTP downloader. `--force-keyframes-at-cuts` is also only
+ * honored by that downloader (it drops `-c copy` so ffmpeg re-encodes
+ * around the boundaries), which is what makes the cut exact. Still a
+ * single yt-dlp call — no separate ffmpeg step in our code.
  */
 export function buildExtractArgs(
   canonicalUrl: string,
@@ -354,7 +357,13 @@ export function buildExtractArgs(
     "--no-warnings",
   ];
   if (sectionArg) {
-    args.push("--download-sections", sectionArg, "--force-keyframes-at-cuts");
+    args.push(
+      "--downloader",
+      "ffmpeg",
+      "--download-sections",
+      sectionArg,
+      "--force-keyframes-at-cuts"
+    );
   }
   if (cookiesFile) args.push("--cookies", cookiesFile);
   args.push("-o", outTemplate, canonicalUrl);
@@ -366,16 +375,19 @@ export function buildExtractArgs(
  *
  * Model-agnostic video for LLM input: only Gemini can be handed a YouTube
  * URL, so every other video model needs a plain HTTPS .mp4 file. We pick a
- * 720p H.264 + AAC stream pair and merge to mp4 with ffmpeg — the widest
- * codec support across the cheap video models (qwen/glm/mimo/omni all take
- * h264). Single yt-dlp call: ffmpeg is invoked by yt-dlp itself.
+ * height-capped H.264 + AAC stream pair and merge to mp4 with ffmpeg — the
+ * widest codec support across the cheap video models (qwen/glm/mimo/omni all
+ * take h264). Single yt-dlp call: ffmpeg is invoked by yt-dlp itself.
+ *
+ * Video is always full length: the API rejects start_time/end_time for
+ * kind=video, so there is no --download-sections here (which would also force
+ * the ffmpeg downloader and a slower re-encode for no benefit).
  */
 export function buildVideoExtractArgs(
   canonicalUrl: string,
   outTemplate: string,
   cookiesFile: string | null,
-  sectionArg: string | null,
-  maxHeight = 720
+  maxHeight = DEFAULT_VIDEO_MAX_HEIGHT
 ): string[] {
   const h = Math.round(maxHeight);
   const args = [
@@ -388,30 +400,26 @@ export function buildVideoExtractArgs(
     "300M",
     "--no-warnings",
   ];
-  if (sectionArg) {
-    args.push("--download-sections", sectionArg, "--force-keyframes-at-cuts");
-  }
   if (cookiesFile) args.push("--cookies", cookiesFile);
   args.push("-o", outTemplate, canonicalUrl);
   return args;
 }
 
 /**
- * Download + merge a 720p mp4. Returns the absolute mp4 path.
+ * Download + merge a height-capped mp4. Returns the absolute mp4 path.
  * Throws BlockedError / TooLargeError / TimeoutError / VideoMergeError / Error.
  */
 export async function runYtDlpVideoExtract(
   canonicalUrl: string,
   tmpDir: string,
   cookiesFile: string | null,
-  sectionArg: string | null = null,
-  timeoutMs = YTDLP_VIDEO_TIMEOUT_MS,
-  maxHeight = 720
+  maxHeight = DEFAULT_VIDEO_MAX_HEIGHT,
+  timeoutMs = YTDLP_VIDEO_TIMEOUT_MS
 ): Promise<{ filepath: string; stdout: string; stderr: string }> {
   const outTemplate = `${tmpDir}/%(id)s.%(ext)s`;
-  const args = buildVideoExtractArgs(canonicalUrl, outTemplate, cookiesFile, sectionArg, maxHeight);
+  const args = buildVideoExtractArgs(canonicalUrl, outTemplate, cookiesFile, maxHeight);
   logger.debug(
-    `[extract:video] start url=${canonicalUrl} tmpDir=${tmpDir} cookies=${cookiesFile ? "yes(path only)" : "no"} sections=${sectionArg ?? "none"}`
+    `[extract:video] start url=${canonicalUrl} tmpDir=${tmpDir} maxHeight=${maxHeight} cookies=${cookiesFile ? "yes(path only)" : "no"}`
   );
   const started = Date.now();
   const { code, stdout, stderr, timedOut } = await runCmd("yt-dlp", args, timeoutMs);

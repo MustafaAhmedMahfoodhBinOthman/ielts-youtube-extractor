@@ -43,6 +43,11 @@ npm test           # vitest run (validate + queue gate tests)
 
 Memory: R2 uploads stream from disk (constant RAM) — sized for `medium-1x`.
 
+Two modes, selected per request with `kind`:
+- `audio` (default) — 128kbps mp3, optional `start_time`/`end_time` trim.
+- `video` — 480p h264+aac mp4 (height via `max_height`), always full length,
+  300MB cap, 600s timeout.
+
 Docker (cold build installs python3/pip/ffmpeg + pinned `yt-dlp==2026.8.19`):
 
 ```bash
@@ -115,12 +120,20 @@ Body:
 }
 ```
 
+| `kind` | no (default `audio`) | `audio` = 128kbps mp3 for the Listening test; `video` = 480p h264/aac mp4 for video models that can't open a YouTube URL |
+| `max_height` | no (default `480`) | video mode only: cap the video height (144–2160) |
+
 `start_time`/`end_time` are optional (seconds number/string or
 `mm:ss` / `hh:mm:ss`). Defaults: start `0`, end omitted = full audio
 (backward compatible). Trimming downloads only the section via
-`yt-dlp --download-sections` — no post-download ffmpeg step. Cuts are exact
-(`--force-keyframes-at-cuts` re-encodes around boundaries, so trimmed
-downloads are slower than full-audio ones).
+`yt-dlp --download-sections` — no post-download ffmpeg step. Sections require
+the ffmpeg downloader (`--downloader ffmpeg`, added only when trimming), so
+trimmed jobs are slower than full-audio ones and cuts are exact
+(`--force-keyframes-at-cuts` re-encodes around the boundaries).
+
+**`kind: "video"` is always full length** — `start_time`/`end_time` are
+rejected with 400 `invalid_range` rather than silently returning the whole
+video.
 
 Accepted URL forms: `youtube.com/watch?v=ID`, `youtube.com/shorts/ID`,
 `youtube.com/embed/ID`, `youtu.be/ID` (11-char ID, else 400 `invalid_url`).
@@ -155,6 +168,25 @@ Success (200):
   "end_seconds": 504,
   "original_duration_seconds": 1823
 }
+```
+
+For `kind: "video"` the result adds `kind: "video"` and `video_url` (same
+object as `audio_url`, named explicitly), is an `.mp4`, and has
+`trimmed: false` with null `start_seconds`/`end_seconds`.
+
+```bash
+# 480p mp4 for a video model (full length)
+curl -s -X POST http://localhost:3000/extract \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"youtube_url":"https://www.youtube.com/watch?v=VIDEOID","kind":"video"}'
+
+# cap the height lower (144-2160; default 480)
+curl -s -X POST http://localhost:3000/extract \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"youtube_url":"https://www.youtube.com/watch?v=VIDEOID","kind":"video","max_height":360}'
+
+# video + a range is rejected (video is always full length)
+# -> 400 {success:false,code:"invalid_range",error:"start_time/end_time are not supported with kind=video ..."}
 ```
 
 (`trimmed:false` → `start_seconds`/`end_seconds` are null; `duration_seconds`
@@ -236,7 +268,8 @@ via `POST /extract`, poll `GET /job/:id` until `done`/`failed`.
 | 401 | `unauthorized` | missing/wrong Bearer token |
 | 400 | `invalid_url` | host/path/ID not an accepted YouTube form, or bad body |
 | 400 | `rejected` | live / private / age-restricted / >60min |
-| 400 | `invalid_range` | bad trim range (negative, `end<=start`, immediate 400) or range outside video duration (async: via failed job; `?wait=true`: immediate 400) |
+| 400 | `invalid_range` | bad trim range (negative, `end<=start`, immediate 400), range outside video duration (async: via failed job; `?wait=true`: immediate 400), or a range passed with `kind:"video"` |
+| 502 | `video_merge_failed` | video mode: no mp4 produced (missing ffmpeg, no 480p pair, or the source has no video stream) |
 | 429 | `busy_retry` | 2 jobs already running — retry shortly |
 | 404 | `not_found` | unknown/expired `GET /job/:id` |
 | 403 | `forbidden` | browser cross-origin request, origin not allowlisted (see CORS) |

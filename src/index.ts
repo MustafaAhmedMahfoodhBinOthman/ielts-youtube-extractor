@@ -335,7 +335,7 @@ async function runExtraction(
     const tExtract = Date.now();
     const { filepath } =
       kind === "video"
-        ? await runYtDlpVideoExtract(canonicalUrl, tmpDir, cookiesFile, sectionArg, undefined, maxHeight)
+        ? await runYtDlpVideoExtract(canonicalUrl, tmpDir, cookiesFile, maxHeight)
         : await runYtDlpExtract(canonicalUrl, tmpDir, cookiesFile, undefined, sectionArg);
     logger.debug(`[job ${jobId}] stage=extract kind=${kind} elapsedMs=${Date.now() - tExtract} file=${filepath}`);
 
@@ -375,7 +375,7 @@ async function runExtraction(
       );
       if (drift > 5) {
         throw new Error(
-          `Trimmed audio is ${Math.round(info.durationSeconds)}s but expected ${Math.round(expectedTrimmed)}s (±5s) ` +
+          `Trimmed ${kind} is ${Math.round(info.durationSeconds)}s but expected ${Math.round(expectedTrimmed)}s (±5s) ` +
             `for range ${range.startSeconds}s-${range.endSeconds !== null ? `${range.endSeconds}s` : "end"} — refusing to upload`
         );
       }
@@ -398,12 +398,17 @@ async function runExtraction(
       r2Key,
       youtube_id: videoId,
       title,
+      // ffprobe first; when trimming and ffprobe failed, fall back to the
+      // requested section length (never the full video, which would
+      // misreport the clip). Untrimmed falls back to the video duration.
       duration_seconds:
         info.durationSeconds != null
           ? Math.round(info.durationSeconds)
-          : meta.duration != null
-            ? Math.round(meta.duration)
-            : null,
+          : trimming && expectedTrimmed != null
+            ? Math.round(expectedTrimmed)
+            : meta.duration != null
+              ? Math.round(meta.duration)
+              : null,
       size: info.sizeBytes,
       trimmed: trimming,
       start_seconds: trimming ? range.startSeconds : null,
@@ -477,6 +482,14 @@ app.post("/extract", authMiddleware, async (req, res) => {
   }
   const { videoId, canonicalUrl, title_hint, kind, max_height } = input;
   logger.debug(`[extract] input videoId=${videoId} kind=${kind} maxHeight=${max_height ?? "default"} hint=${title_hint ? "yes" : "no"}`);
+  // Video is always full length (single ffmpeg pass, no section re-encode).
+  // Reject a range instead of silently returning the whole video.
+  if (kind === "video" && (input.start_time !== undefined || input.end_time !== undefined)) {
+    const msg = "start_time/end_time are not supported with kind=video (video jobs are always full length)";
+    logger.debug(`[extract] reject ${msg}`);
+    res.status(400).json({ success: false, code: "invalid_range", error: msg });
+    return;
+  }
   let range: ParsedRange;
   try {
     range = parseTimeRange(input.start_time, input.end_time);

@@ -83,13 +83,22 @@ describe("buildExtractArgs", () => {
   const BASE = ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "128K"];
 
   it("adds accurate section-cut flags when trimming", () => {
-    const args = buildExtractArgs("https://www.youtube.com/watch?v=x", "/tmp/yt-j/%(id)s.%(ext)s", null, "*0:00:30-0:10:00");
+    const args = buildExtractArgs(
+      "https://www.youtube.com/watch?v=x",
+      "/tmp/yt-j/%(id)s.%(ext)s",
+      null,
+      "*0:00:30-0:10:00"
+    );
     for (const flag of BASE) expect(args).toContain(flag);
     const i = args.indexOf("--download-sections");
     expect(i).toBeGreaterThan(-1);
     expect(args[i + 1]).toBe("*0:00:30-0:10:00");
-    // Exact cuts: without this, yt-dlp seeks to the nearest seek point and
-    // audio before start_time leaks into the mp3.
+    // Sections REQUIRE the ffmpeg downloader: yt-dlp aborts with "This
+    // format cannot be partially downloaded" when a section is requested
+    // from the native http downloader (https has no PROTOCOL_MAP entry).
+    expect(args[args.indexOf("--downloader") + 1]).toBe("ffmpeg");
+    // Exact cuts: only honored by that downloader, which then drops
+    // `-c copy` so ffmpeg re-encodes around the boundaries.
     expect(args).toContain("--force-keyframes-at-cuts");
   });
 
@@ -97,19 +106,21 @@ describe("buildExtractArgs", () => {
     const args = buildExtractArgs("url", "tmpl", "/tmp/cookies.txt", null);
     expect(args).not.toContain("--download-sections");
     expect(args).not.toContain("--force-keyframes-at-cuts");
+    // Do not slow the common full-audio path down with the ffmpeg downloader.
+    expect(args).not.toContain("--downloader");
     expect(args).toContain("--cookies");
     expect(args.slice(-3)).toEqual(["-o", "tmpl", "url"]);
   });
 });
 
 describe("buildVideoExtractArgs", () => {
-  it("requests a capped-height mp4+audio pair merged to mp4", () => {
-    const args = buildVideoExtractArgs("url", "tmpl", null, null);
+  it("requests a 480p mp4+audio pair merged to mp4 by default", () => {
+    const args = buildVideoExtractArgs("url", "tmpl", null);
     const fmt = args[args.indexOf("-f") + 1];
     // Every fallback branch is height-capped: an unbounded `best` branch would
     // silently pull 4K and blow up the model's token bill.
-    expect(fmt).toContain("height<=720");
-    for (const branch of fmt.split("/")) expect(branch).toContain("height<=720");
+    expect(fmt).toContain("height<=480");
+    for (const branch of fmt.split("/")) expect(branch).toContain("height<=480");
     expect(args[args.indexOf("--merge-output-format") + 1]).toBe("mp4");
     // mp3 extraction flags must NOT leak into the video path.
     expect(args).not.toContain("-x");
@@ -119,14 +130,16 @@ describe("buildVideoExtractArgs", () => {
   });
 
   it("honours a custom max height", () => {
-    const args = buildVideoExtractArgs("url", "tmpl", null, null, 480);
-    expect(args[args.indexOf("-f") + 1]).toContain("height<=480");
+    const args = buildVideoExtractArgs("url", "tmpl", null, 1080);
+    expect(args[args.indexOf("-f") + 1]).toContain("height<=1080");
   });
 
-  it("adds section-cut flags and cookies when trimming", () => {
-    const args = buildVideoExtractArgs("url", "tmpl", "/tmp/cookies.txt", "*0:00:10-0:02:00");
-    expect(args[args.indexOf("--download-sections") + 1]).toBe("*0:00:10-0:02:00");
-    expect(args).toContain("--force-keyframes-at-cuts");
+  it("never requests sections (video is always full length)", () => {
+    const args = buildVideoExtractArgs("url", "tmpl", "/tmp/cookies.txt", 720);
+    expect(args).not.toContain("--download-sections");
+    expect(args).not.toContain("--force-keyframes-at-cuts");
+    // Also must not force the ffmpeg downloader for the full-length path.
+    expect(args).not.toContain("--downloader");
     expect(args).toContain("--cookies");
   });
 });

@@ -1,4 +1,5 @@
 import pLimit from "p-limit";
+import { logger } from "./logger.js";
 
 /**
  * Max 2 concurrent extractions. Extra requests are rejected immediately
@@ -31,6 +32,12 @@ export function isBusy(): boolean {
  * dispatched through the limiter.
  */
 export function tryRun<T>(fn: () => Promise<T>): Promise<T> | null {
-  if (limit.activeCount + limit.pendingCount >= MAX_CONCURRENT) return null;
+  const active = limit.activeCount;
+  const pending = limit.pendingCount;
+  if (active + pending >= MAX_CONCURRENT) {
+    logger.debug(`[queue] REJECT active=${active} pending=${pending} max=${MAX_CONCURRENT}`);
+    return null;
+  }
+  logger.debug(`[queue] ADMIT active=${active} pending=${pending} max=${MAX_CONCURRENT}`);
   return limit(fn);
 }

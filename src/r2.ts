@@ -3,6 +3,7 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
 import { MAX_FILE_BYTES } from "./extract.js";
+import { logger } from "./logger.js";
 
 let client: S3Client | null = null;
 
@@ -49,6 +50,7 @@ export async function uploadToR2(
   filename: string
 ): Promise<{ r2Key: string; audioUrl: string }> {
   const st = await stat(localPath);
+  logger.debug(`[r2] stat localPath=${localPath} sizeBytes=${st.size}`);
   if (st.size > MAX_FILE_BYTES) {
     throw new Error(`Audio is ${(st.size / 1024 / 1024).toFixed(1)}MB, exceeds 100MB limit`);
   }
@@ -56,7 +58,12 @@ export async function uploadToR2(
   const key = `predictions/${path.basename(filename)}`;
   const s3 = getS3Client();
   // Stream: constant memory regardless of file size (10-100MB).
+  const started = Date.now();
+  logger.debug(`[r2] upload start bucket=${bucket} key=${key} sizeBytes=${st.size}`);
   const body = createReadStream(localPath);
+  body.on("error", (err) => {
+    logger.debug(`[r2] stream error key=${key} err=${String(err).slice(0, 200)}`);
+  });
   try {
     await s3.send(
       new PutObjectCommand({
@@ -67,8 +74,10 @@ export async function uploadToR2(
       })
     );
   } catch (err) {
+    logger.debug(`[r2] upload failed key=${key} elapsedMs=${Date.now() - started} err=${String(err).slice(0, 300)}`);
     body.destroy();
     throw err;
   }
+  logger.debug(`[r2] upload done key=${key} sizeBytes=${st.size} elapsedMs=${Date.now() - started}`);
   return { r2Key: key, audioUrl: publicUrlForKey(key) };
 }

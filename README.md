@@ -24,6 +24,7 @@ Listens on `PORT` (default 3000).
 | `R2_PUBLIC_URL` | yes | e.g. `https://pub-<id>.r2.dev` (no trailing slash needed) |
 | `YTDLP_COOKIES_B64` | no | base64 of Netscape `cookies.txt` for 429/403 recovery |
 | `ALLOWED_ORIGINS` | no | comma-separated CORS origins (e.g. `https://admin.example.com`). Empty = default deny: browser cross-origin rejected 403; same-origin + curl/no-Origin allowed |
+| `LOG_LEVEL` | no (default `info`) | `debug` = per-stage diagnostics (queue, auth outcome, oEmbed, yt-dlp spawn/exit, ffprobe, R2, job transitions). Never logs tokens/secrets |
 
 ```bash
 cp .env.example .env
@@ -208,6 +209,35 @@ admin UI origin when the panel calls this service from a browser.
 npm test   # vitest: validate.test.ts (URL forms, slugs, filenames)
            # + queue.test.ts (admission gate: 5 parallel -> 2 run, 3 get 429)
 ```
+
+## Logging
+
+`LOG_LEVEL=debug` traces every stage of a job:
+
+```
+[http] POST /extract origin=none
+[auth] accept POST /extract
+[extract] input videoId=dQw4w9WgXcQ hint=yes
+[queue] ADMIT active=0 pending=0 max=2
+[job ...] tmp ready dir=/tmp/yt-...
+[validate] ok videoId=... host=www.youtube.com
+[oembed] hit videoId=... elapsedMs=231 title="..." author="..."
+[meta] fetch url=... cookies=no
+[yt-dlp] spawn: yt-dlp --dump-single-json ... timeoutMs=60000
+[yt-dlp] exit: yt-dlp code=0 elapsedMs=1843 timedOut=false ...
+[meta] parsed duration=1423 isLive=false liveStatus=null availability=public ...
+[meta] allowed duration=1423 ...
+[extract] start url=... tmpDir=... cookies=no
+[extract] tmp listing count=1 mp3=1 ...
+[ffprobe] file=... sizeBytes=... durationSeconds=...
+[r2] upload start bucket=ielts-audio key=predictions/... sizeBytes=...
+[r2] upload done key=... elapsedMs=912
+[job ...] tmp cleaned dir=...
+```
+
+Guarantee: logs never contain `ADMIN_TOKEN`, `Authorization` values,
+`R2_SECRET_ACCESS_KEY`, cookie file contents, or full env — presence only
+(`set`/`missing`). yt-dlp args log the cookies *path*, never its contents.
 
 Secrets (`ADMIN_TOKEN`, full R2 secret) are never logged; startup logs only
 show presence (`set`/`missing`) and cookie status.

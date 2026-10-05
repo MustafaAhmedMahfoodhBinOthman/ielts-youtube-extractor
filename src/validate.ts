@@ -2,6 +2,7 @@
  * YouTube URL parsing + filename sanitization.
  * No secrets, no network — pure functions, easy to unit test.
  */
+import { logger } from "./logger.js";
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
@@ -73,9 +74,11 @@ export function parseYoutubeUrl(raw: string): { videoId: string; canonicalUrl: s
   }
 
   if (!videoId) {
+    logger.debug(`[validate] reject host=${u.hostname} path=${u.pathname}`);
     throw new InvalidUrlError();
   }
 
+  logger.debug(`[validate] ok videoId=${videoId} host=${u.hostname}`);
   return {
     videoId,
     canonicalUrl: `https://www.youtube.com/watch?v=${videoId}`,

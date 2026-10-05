@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import ffmpeg from "fluent-ffmpeg";
+import { logger } from "./logger.js";
 
 export const MAX_DURATION_SECONDS = 3600; // 60 min
 export const MAX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
@@ -52,6 +53,7 @@ export interface OembedInfo {
 }
 
 export async function getOembed(videoId: string, timeoutMs = 10_000): Promise<OembedInfo> {
+  const started = Date.now();
   const canonical = `https://www.youtube.com/watch?v=${videoId}`;
   const url = `https://www.youtube.com/oembed?url=${encodeURIComponent(canonical)}&format=json`;
   const ctrl = new AbortController();
@@ -61,13 +63,22 @@ export async function getOembed(videoId: string, timeoutMs = 10_000): Promise<Oe
       signal: ctrl.signal,
       headers: { "User-Agent": "ielts-youtube-extractor/1.0" },
     });
-    if (!res.ok) return { title: null, author: null };
+    if (!res.ok) {
+      logger.debug(`[oembed] miss videoId=${videoId} http=${res.status} elapsedMs=${Date.now() - started}`);
+      return { title: null, author: null };
+    }
     const json = (await res.json()) as { title?: string; author_name?: string };
-    return {
+    const info = {
       title: typeof json.title === "string" ? json.title : null,
       author: typeof json.author_name === "string" ? json.author_name : null,
     };
-  } catch {
+    logger.debug(
+      `[oembed] hit videoId=${videoId} elapsedMs=${Date.now() - started} ` +
+        `title=${info.title ? JSON.stringify(info.title.slice(0, 100)) : "null"} author=${info.author ?? "null"}`
+    );
+    return info;
+  } catch (err) {
+    logger.debug(`[oembed] error videoId=${videoId} elapsedMs=${Date.now() - started} err=${String(err).slice(0, 150)}`);
     return { title: null, author: null };
   } finally {
     clearTimeout(t);
@@ -90,6 +101,8 @@ function runCmd(
   timeoutMs: number
 ): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
+    const started = Date.now();
+    logger.debug(`[yt-dlp] spawn: ${cmd} ${args.join(" ")} timeoutMs=${timeoutMs}`);
     const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
@@ -108,10 +121,14 @@ function runCmd(
     });
     child.on("error", (err) => {
       clearTimeout(kill);
+      logger.debug(`[yt-dlp] spawn error: ${cmd} elapsedMs=${Date.now() - started} err=${String(err).slice(0, 200)}`);
       resolve({ code: 1, stdout, stderr: stderr + `\nspawn error: ${String(err)}`, timedOut });
     });
     child.on("close", (code) => {
       clearTimeout(kill);
+      logger.debug(
+        `[yt-dlp] exit: ${cmd} code=${code} elapsedMs=${Date.now() - started} timedOut=${timedOut} stdoutBytes=${stdout.length} stderrBytes=${stderr.length}`
+      );
       resolve({ code, stdout, stderr, timedOut });
     });
   });
@@ -144,7 +161,10 @@ export async function getYtDlpMetadata(
   const args = ["--dump-single-json", "--no-playlist", "--no-warnings", "--socket-timeout", "15"];
   if (cookiesFile) args.push("--cookies", cookiesFile);
   args.push(canonicalUrl);
+  logger.debug(`[meta] fetch url=${canonicalUrl} cookies=${cookiesFile ? "yes(path only)" : "no"}`);
+  const started = Date.now();
   const { code, stdout, stderr, timedOut } = await runCmd("yt-dlp", args, timeoutMs);
+  logger.debug(`[meta] raw elapsedMs=${Date.now() - started} code=${code} timedOut=${timedOut} jsonBytes=${stdout.length}`);
   const combined = `${stdout}\n${stderr}`;
   if (timedOut) throw new TimeoutError("metadata fetch timed out");
   if (code !== 0) {
@@ -161,7 +181,7 @@ export async function getYtDlpMetadata(
     typeof json["duration"] === "number" && Number.isFinite(json["duration"])
       ? (json["duration"] as number)
       : null;
-  return {
+  const meta: YtDlpMetadata = {
     title: typeof json["title"] === "string" ? (json["title"] as string) : null,
     duration,
     isLive: json["is_live"] === true,
@@ -175,6 +195,12 @@ export async function getYtDlpMetadata(
           ? (json["channel"] as string)
           : null,
   };
+  logger.debug(
+    `[meta] parsed duration=${meta.duration} isLive=${meta.isLive} liveStatus=${meta.liveStatus} ` +
+      `availability=${meta.availability} ageLimit=${meta.ageLimit} uploader=${meta.uploader ?? "null"} ` +
+      `title=${meta.title ? JSON.stringify(meta.title.slice(0, 100)) : "null"}`
+  );
+  return meta;
 }
 
 export function assertMetadataAllowed(meta: YtDlpMetadata): void {
@@ -198,6 +224,7 @@ export function assertMetadataAllowed(meta: YtDlpMetadata): void {
   if (meta.duration != null && meta.duration > MAX_DURATION_SECONDS) {
     throw new RejectedError(`duration ${Math.round(meta.duration)}s exceeds 3600s (60min) limit`);
   }
+  logger.debug(`[meta] allowed duration=${meta.duration} liveStatus=${meta.liveStatus} availability=${meta.availability}`);
 }
 
 /**
@@ -227,7 +254,10 @@ export async function runYtDlpExtract(
   if (cookiesFile) args.push("--cookies", cookiesFile);
   args.push("-o", outTemplate, canonicalUrl);
 
+  logger.debug(`[extract] start url=${canonicalUrl} tmpDir=${tmpDir} cookies=${cookiesFile ? "yes(path only)" : "no"}`);
+  const started = Date.now();
   const { code, stdout, stderr, timedOut } = await runCmd("yt-dlp", args, timeoutMs);
+  logger.debug(`[extract] yt-dlp done code=${code} timedOut=${timedOut} elapsedMs=${Date.now() - started}`);
   const combined = `${stdout}\n${stderr}`;
 
   if (timedOut) throw new TimeoutError();
@@ -241,6 +271,7 @@ export async function runYtDlpExtract(
 
   const entries = await fs.readdir(tmpDir);
   const mp3 = entries.filter((f) => f.toLowerCase().endsWith(".mp3")).sort();
+  logger.debug(`[extract] tmp listing count=${entries.length} mp3=${mp3.length} files=${entries.slice(0, 10).join(",") || "none"}`);
   if (mp3.length === 0) {
     // Include listing to help debug (no secrets)
     throw new Error(`yt-dlp finished but no .mp3 found in tmp dir (files: ${entries.join(", ") || "none"})`);
@@ -259,6 +290,8 @@ export async function runYtDlpExtract(
     }
     filepath = biggest;
   }
+  const finalStat = await fs.stat(filepath);
+  logger.debug(`[extract] picked file=${filepath} sizeBytes=${finalStat.size} elapsedMs=${Date.now() - started}`);
   return { filepath, stdout: stdout.slice(-4000), stderr: stderr.slice(-4000) };
 }
 
@@ -270,7 +303,10 @@ export interface MediaInfo {
 export function probeDuration(filepath: string): Promise<number | null> {
   return new Promise((resolve) => {
     ffmpeg.ffprobe(filepath, (err, metadata) => {
-      if (err) return resolve(null);
+      if (err) {
+        logger.debug(`[ffprobe] error file=${filepath} err=${String(err).slice(0, 200)}`);
+        return resolve(null);
+      }
       const d = metadata?.format?.duration as unknown;
       if (typeof d === "number" && Number.isFinite(d)) return resolve(d);
       if (typeof d === "string" && d.trim() !== "" && Number.isFinite(Number(d))) return resolve(Number(d));
@@ -282,5 +318,6 @@ export function probeDuration(filepath: string): Promise<number | null> {
 export async function getMediaInfo(filepath: string): Promise<MediaInfo> {
   const stat = await fs.stat(filepath);
   const durationSeconds = await probeDuration(filepath);
+  logger.debug(`[ffprobe] file=${filepath} sizeBytes=${stat.size} durationSeconds=${durationSeconds}`);
   return { durationSeconds, sizeBytes: stat.size };
 }

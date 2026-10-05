@@ -23,6 +23,7 @@ import {
 } from "./extract.js";
 import { tryRun } from "./queue.js";
 import { uploadToR2 } from "./r2.js";
+import { LOG_LEVEL, logger } from "./logger.js";
 
 const PORT = Number(process.env.PORT || "3000");
 
@@ -101,13 +102,22 @@ function isAuthorized(req: express.Request): boolean {
 
 function authMiddleware(req: express.Request, res: express.Response, next: express.NextFunction): void {
   if (!getAdminToken()) {
+    logger.warn("[auth] ADMIN_TOKEN not set on server");
     res.status(500).json({ success: false, code: "misconfigured", error: "ADMIN_TOKEN not set on server" });
     return;
   }
-  if (!isAuthorized(req)) {
+  const header = req.headers.authorization;
+  if (typeof header !== "string" || !/^Bearer\s+.+$/i.test(header)) {
+    logger.debug(`[auth] reject ${req.method} ${req.path}: missing/malformed Authorization header`);
     res.status(401).json({ success: false, code: "unauthorized", error: "Missing or invalid token" });
     return;
   }
+  if (!isAuthorized(req)) {
+    logger.debug(`[auth] reject ${req.method} ${req.path}: token mismatch`);
+    res.status(401).json({ success: false, code: "unauthorized", error: "Missing or invalid token" });
+    return;
+  }
+  logger.debug(`[auth] accept ${req.method} ${req.path}`);
   next();
 }
 
@@ -155,6 +165,7 @@ if (allowList.length > 0) {
       sameOrigin = false;
     }
     if (sameOrigin) {
+      logger.debug(`[cors] allow same-origin ${req.method} ${req.path} origin=${String(origin)}`);
       res.setHeader("Access-Control-Allow-Origin", String(origin));
       res.setHeader("Vary", "Origin");
       if (req.method === "OPTIONS") {
@@ -164,14 +175,17 @@ if (allowList.length > 0) {
       }
       return next();
     }
+    logger.debug(`[cors] deny ${req.method} ${req.path} origin=${String(origin)} host=${host ?? "none"}`);
     return res.status(403).json({ success: false, code: "forbidden", error: "CORS: origin not allowed" });
   });
 }
 
-// Never log tokens/secrets: tiny redaction middleware for error logs
-function safeLog(...args: unknown[]): void {
-  console.log(...args);
-}
+// Per-request access log (method/path/query only — never headers or body secrets).
+app.use((req, _res, next) => {
+  const qs = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+  logger.debug(`[http] ${req.method} ${req.path}${qs} origin=${req.headers.origin ?? "none"}`);
+  next();
+});
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, ytDlp: ytDlpVersion, ffmpeg: ffmpegVersion });
@@ -209,8 +223,10 @@ const jobs = new Map<string, Job>();
 const JOB_TTL_MS = 3_600_000; // 1h: keep result/error for polling, then drop
 
 function scheduleJobCleanup(jobId: string): void {
+  logger.debug(`[job ${jobId}] ttl scheduled ttlMs=${JOB_TTL_MS}`);
   const t = setTimeout(() => {
-    jobs.delete(jobId);
+    const existed = jobs.delete(jobId);
+    logger.debug(`[job ${jobId}] ttl expired removed=${existed}`);
   }, JOB_TTL_MS);
   // Don't hold the process open for cleanup timers in tests/dev.
   (t as unknown as { unref?: () => void }).unref?.();
@@ -254,21 +270,33 @@ async function runExtraction(
   canonicalUrl: string,
   title_hint: string | undefined
 ): Promise<JobResult> {
+  const jobStarted = Date.now();
   const tmpDir = path.join(os.tmpdir(), `yt-${jobId}`);
   await fs.mkdir(tmpDir, { recursive: true });
+  logger.debug(`[job ${jobId}] tmp ready dir=${tmpDir}`);
   try {
     // oEmbed (best-effort) + yt-dlp metadata (authoritative for duration/restrictions)
+    const tMeta = Date.now();
     const [oembed, meta] = await Promise.all([getOembed(videoId), getYtDlpMetadata(canonicalUrl, cookiesFile)]);
+    logger.debug(`[job ${jobId}] stage=metadata elapsedMs=${Date.now() - tMeta} oembedTitle=${oembed.title ? "yes" : "no"}`);
 
     assertMetadataAllowed(meta);
+    logger.debug(`[job ${jobId}] stage=allowed duration=${meta.duration}`);
 
     const title = (oembed.title || meta.title || title_hint || videoId).trim().slice(0, 200) || videoId;
+    logger.debug(`[job ${jobId}] stage=title len=${title.length} hint=${title_hint ? `yes(${title_hint.length}ch)` : "no"}`);
 
     // Extract mp3 (240s timeout inside)
+    const tExtract = Date.now();
     const { filepath } = await runYtDlpExtract(canonicalUrl, tmpDir, cookiesFile);
+    logger.debug(`[job ${jobId}] stage=extract elapsedMs=${Date.now() - tExtract} file=${filepath}`);
 
     // Verify: exists, size, ffprobe duration
+    const tVerify = Date.now();
     const info = await getMediaInfo(filepath);
+    logger.debug(
+      `[job ${jobId}] stage=verify elapsedMs=${Date.now() - tVerify} sizeBytes=${info.sizeBytes} durationSeconds=${info.durationSeconds}`
+    );
     if (info.sizeBytes > MAX_FILE_BYTES) {
       throw new TooLargeError(`Audio is ${(info.sizeBytes / 1024 / 1024).toFixed(1)}MB, exceeds 100MB limit`);
     }
@@ -279,11 +307,14 @@ async function runExtraction(
     // Prefer title_hint for the filename slug when provided, fall back to resolved title
     const slugBase = (title_hint && title_hint.trim()) || title;
     const filename = buildFilename(slugBase, videoId);
+    logger.debug(`[job ${jobId}] stage=filename file=${filename}`);
 
     // Upload to R2 (streamed)
+    const tUpload = Date.now();
     const { r2Key, audioUrl } = await uploadToR2(filepath, filename);
+    logger.debug(`[job ${jobId}] stage=upload elapsedMs=${Date.now() - tUpload} r2Key=${r2Key}`);
 
-    return {
+    const result = {
       audio_url: audioUrl,
       r2Key,
       youtube_id: videoId,
@@ -296,12 +327,15 @@ async function runExtraction(
             : null,
       size: info.sizeBytes,
     };
+    logger.debug(`[job ${jobId}] stage=result totalElapsedMs=${Date.now() - jobStarted} size=${result.size}`);
+    return result;
   } finally {
     // Cleanup /tmp always (job record stays in Map for 1h of polling)
     try {
       await fs.rm(tmpDir, { recursive: true, force: true });
-    } catch {
-      // ignore
+      logger.debug(`[job ${jobId}] tmp cleaned dir=${tmpDir}`);
+    } catch (err) {
+      logger.warn(`[job ${jobId}] tmp cleanup failed dir=${tmpDir} err=${String(err).slice(0, 150)}`);
     }
   }
 }
@@ -336,19 +370,23 @@ app.post("/extract", authMiddleware, async (req, res) => {
 
   const input = parseExtractInput(req.body);
   if (!input.ok) {
+    logger.debug(`[extract] reject body status=${input.status}`);
     res.status(input.status).json(input.body);
     return;
   }
   const { videoId, canonicalUrl, title_hint } = input;
+  logger.debug(`[extract] input videoId=${videoId} hint=${title_hint ? "yes" : "no"}`);
   const wait = req.query.wait === "true";
+  logger.debug(`[extract] mode=${wait ? "sync(wait=true)" : "async"} videoId=${videoId}`);
 
   // Local-dev synchronous path: request waits 30-120s for the result.
   if (wait) {
     const jobId = uuidv4();
-    safeLog(`[job ${jobId}] sync start ${redactUrlForLog(canonicalUrl)}`);
+    logger.info(`[job ${jobId}] sync start ${redactUrlForLog(canonicalUrl)}`);
     // Atomic admission (no await between busy-check and dispatch — see queue.ts).
     const p = tryRun(() => runExtraction(jobId, videoId, canonicalUrl, title_hint));
     if (!p) {
+      logger.debug(`[job ${jobId}] sync reject busy videoId=${videoId}`);
       res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
       return;
     }
@@ -356,10 +394,11 @@ app.post("/extract", authMiddleware, async (req, res) => {
       const result = await p;
       res.setHeader("Cache-Control", "no-store");
       res.json({ success: true, ...result });
-      safeLog(`[job ${jobId}] sync done ${videoId} -> ${result.r2Key} (${result.size} bytes)`);
+      logger.info(`[job ${jobId}] sync done ${videoId} -> ${result.r2Key} (${result.size} bytes)`);
     } catch (err) {
       const mapped = toJobError(err);
-      if (mapped.status >= 500) console.error(`[job ${jobId}] sync failed:`, mapped.body.error.slice(0, 300));
+      logger.debug(`[job ${jobId}] sync error code=${mapped.body.code} status=${mapped.status}`);
+      if (mapped.status >= 500) logger.error(`[job ${jobId}] sync failed:`, mapped.body.error.slice(0, 300));
       res.status(mapped.status).json({ success: false, ...mapped.body });
     }
     return;
@@ -376,21 +415,23 @@ app.post("/extract", authMiddleware, async (req, res) => {
   // Atomic admission before promising anything.
   const p = tryRun(async () => {
     job.status = "running";
-    safeLog(`[job ${job.id}] start ${redactUrlForLog(canonicalUrl)}`);
+    logger.info(`[job ${job.id}] start ${redactUrlForLog(canonicalUrl)}`);
     try {
       const result = await runExtraction(job.id, videoId, canonicalUrl, title_hint);
       job.status = "done";
       job.result = result;
-      safeLog(`[job ${job.id}] done ${videoId} -> ${result.r2Key} (${result.size} bytes)`);
+      logger.info(`[job ${job.id}] done ${videoId} -> ${result.r2Key} (${result.size} bytes)`);
     } catch (err) {
       const mapped = toJobError(err);
       job.status = "failed";
       job.error = mapped.body;
-      if (mapped.status >= 500) console.error(`[job ${job.id}] failed:`, mapped.body.error.slice(0, 300));
-      else safeLog(`[job ${job.id}] failed: ${mapped.body.code}`);
+      logger.debug(`[job ${job.id}] error code=${mapped.body.code} status=${mapped.status}`);
+      if (mapped.status >= 500) logger.error(`[job ${job.id}] failed:`, mapped.body.error.slice(0, 300));
+      else logger.info(`[job ${job.id}] failed: ${mapped.body.code}`);
     }
   });
   if (!p) {
+    logger.debug(`[extract] async reject busy videoId=${videoId}`);
     res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
     return;
   }
@@ -398,6 +439,7 @@ app.post("/extract", authMiddleware, async (req, res) => {
   scheduleJobCleanup(job.id);
   // Surface background failures (already recorded on the job) without crashing.
   p.catch(() => undefined);
+  logger.debug(`[job ${job.id}] accepted status=${job.status} videoId=${videoId}`);
   res.status(202).json({ success: true, jobId: job.id, status: job.status });
 });
 
@@ -405,9 +447,11 @@ app.get("/job/:id", authMiddleware, (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const job = jobs.get(req.params.id);
   if (!job) {
+    logger.debug(`[job] poll miss id=${req.params.id}`);
     res.status(404).json({ success: false, code: "not_found", error: "Unknown or expired job id" });
     return;
   }
+  logger.debug(`[job ${job.id}] poll status=${job.status}`);
   res.json({
     success: true,
     jobId: job.id,
@@ -433,7 +477,8 @@ async function main(): Promise<void> {
       `R2_BUCKET=${process.env.R2_BUCKET || "missing"} ` +
       `R2_PUBLIC_URL=${process.env.R2_PUBLIC_URL ? "set" : "missing"} ` +
       `COOKIES=${cookiesFile ? "loaded" : "none"} ` +
-      `CORS=${allowList.length > 0 ? "allowlist" : "default-deny"}`
+      `CORS=${allowList.length > 0 ? "allowlist" : "default-deny"} ` +
+      `LOG_LEVEL=${LOG_LEVEL} NODE=${process.version}`
   );
   // Only listen when run directly (never under vitest imports).
   app.listen(PORT, () => {

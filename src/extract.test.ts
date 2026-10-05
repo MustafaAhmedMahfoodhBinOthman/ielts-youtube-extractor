@@ -114,13 +114,19 @@ describe("buildExtractArgs", () => {
 });
 
 describe("buildVideoExtractArgs", () => {
-  it("requests a 480p mp4+audio pair merged to mp4 by default", () => {
+  it("requests a 480p H.264/AAC pair merged to mp4 by default", () => {
     const args = buildVideoExtractArgs("url", "tmpl", null);
     const fmt = args[args.indexOf("-f") + 1];
     // Every fallback branch is height-capped: an unbounded `best` branch would
     // silently pull 4K and blow up the model's token bill.
     expect(fmt).toContain("height<=480");
     for (const branch of fmt.split("/")) expect(branch).toContain("height<=480");
+    // Regression: `[ext=mp4]` alone does NOT pin the codec. It constrains the
+    // container, so yt-dlp falls through to YouTube's VP9/AV1 default — which
+    // several cheap video models reject. Verified on a real 480p pull.
+    for (const branch of fmt.split("/")) expect(branch).toContain("vcodec^=avc1");
+    expect(fmt).toContain("acodec^=mp4a");
+    expect(fmt).not.toContain("[ext=mp4]");
     expect(args[args.indexOf("--merge-output-format") + 1]).toBe("mp4");
     // mp3 extraction flags must NOT leak into the video path.
     expect(args).not.toContain("-x");

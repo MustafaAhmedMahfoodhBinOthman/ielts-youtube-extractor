@@ -374,10 +374,17 @@ export function buildExtractArgs(
  * Build the yt-dlp video-extraction argv (pure — unit tested).
  *
  * Model-agnostic video for LLM input: only Gemini can be handed a YouTube
- * URL, so every other video model needs a plain HTTPS .mp4 file. We pick a
- * height-capped H.264 + AAC stream pair and merge to mp4 with ffmpeg — the
- * widest codec support across the cheap video models (qwen/glm/mimo/omni all
- * take h264). Single yt-dlp call: ffmpeg is invoked by yt-dlp itself.
+ * URL, so every other video model needs a plain HTTPS .mp4 file.
+ *
+ * The codec MUST be pinned with `vcodec^=avc1`, not just `[ext=mp4]`:
+ * `[ext=mp4]` constrains the *container*, and when no mp4 video-only stream
+ * exists at the requested height yt-dlp silently falls through to YouTube's
+ * default codec — VP9 or AV1. Those decode fine in a browser but several
+ * cheap video models only accept H.264, so the run fails at the provider
+ * with no clue why. H.264 + AAC is the widest-common-denominator pair.
+ *
+ * Every branch keeps both the height cap and the codec pin. Single yt-dlp
+ * call: ffmpeg is invoked by yt-dlp itself.
  *
  * Video is always full length: the API rejects start_time/end_time for
  * kind=video, so there is no --download-sections here (which would also force
@@ -392,7 +399,8 @@ export function buildVideoExtractArgs(
   const h = Math.round(maxHeight);
   const args = [
     "-f",
-    `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`,
+    `bestvideo[height<=${h}][vcodec^=avc1]+bestaudio[acodec^=mp4a]` +
+      `/best[height<=${h}][vcodec^=avc1]`,
     "--merge-output-format",
     "mp4",
     "--no-playlist",
@@ -449,9 +457,9 @@ export async function runYtDlpVideoExtract(
     `[extract:video] tmp listing count=${entries.length} mp4=${mp4.length} files=${entries.slice(0, 10).join(",") || "none"}`
   );
   if (mp4.length === 0) {
-    throw new Error(
+    throw new VideoMergeError(
       `yt-dlp finished but no .mp4 found in tmp dir (files: ${entries.join(", ") || "none"}). ` +
-        `The source may have no video+audio pair at 720p.`
+        `The source likely has no H.264 stream at ${Math.round(maxHeight)}p.`
     );
   }
   // Take the largest mp4: that is the merged video+audio output, never a
@@ -468,6 +476,18 @@ export async function runYtDlpVideoExtract(
       }
     }
     filepath = biggest;
+  }
+
+  // Guard the codec promise. The -f selector pins avc1, but a re-mux or an
+  // unexpected stream must never ship as "h264" — several cheap video models
+  // reject VP9/AV1 outright and the failure surfaces at the provider with no
+  // useful context. Fail here, where the cause is obvious.
+  const codecs = await probeVideoCodec(filepath);
+  if (codecs.video && !/^avc1$/i.test(codecs.video)) {
+    throw new VideoMergeError(
+      `Expected H.264 (avc1) video for model compatibility but got "${codecs.video}". ` +
+        `VP9/AV1 are rejected by several video models.`
+    );
   }
   const finalStat = await fs.stat(filepath);
   logger.debug(`[extract:video] picked file=${filepath} sizeBytes=${finalStat.size} elapsedMs=${Date.now() - started}`);
@@ -570,6 +590,24 @@ export function hasVideoStream(filepath: string): Promise<boolean> {
       const has = streams.some((s) => s.codec_type === "video");
       logger.debug(`[ffprobe] video-stream file=${filepath} streams=${streams.length} hasVideo=${has}`);
       resolve(has);
+    });
+  });
+}
+
+/** Codec names of the first video/audio stream, or null when absent. */
+export function probeVideoCodec(filepath: string): Promise<{ video: string | null; audio: string | null }> {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filepath, (err, metadata) => {
+      if (err) {
+        logger.debug(`[ffprobe] codec probe failed file=${filepath} err=${String(err).slice(0, 200)}`);
+        return resolve({ video: null, audio: null });
+      }
+      const streams = (metadata?.streams ?? []) as Array<{ codec_type?: string; codec_name?: string }>;
+      const pick = (type: string) =>
+        streams.find((s) => s.codec_type === type)?.codec_name ?? null;
+      const out = { video: pick("video"), audio: pick("audio") };
+      logger.debug(`[ffprobe] codecs file=${filepath} video=${out.video ?? "none"} audio=${out.audio ?? "none"}`);
+      resolve(out);
     });
   });
 }

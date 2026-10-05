@@ -5,7 +5,14 @@ import { logger } from "./logger.js";
 
 export const MAX_DURATION_SECONDS = 3600; // 60 min
 export const MAX_FILE_BYTES = 100 * 1024 * 1024; // 100MB
+/** Video mode: 720p mp4 runs bigger than 128kbps mp3, so it gets its own cap. */
+export const MAX_VIDEO_FILE_BYTES = 300 * 1024 * 1024; // 300MB
 export const YTDLP_EXTRACT_TIMEOUT_MS = 240_000; // 240s
+/** Video mode needs longer than audio (bigger download + ffmpeg merge). */
+export const YTDLP_VIDEO_TIMEOUT_MS = 600_000; // 600s
+
+/** What the caller wants out of a job: audio-only (default) or a video file. */
+export type MediaKind = "audio" | "video";
 
 export class RejectedError extends Error {
   code = "rejected" as const;
@@ -44,6 +51,16 @@ export class TimeoutError extends Error {
   constructor(message = "yt-dlp timed out after 240s") {
     super(message);
     this.name = "TimeoutError";
+  }
+}
+
+/** yt-dlp merge/re-encode failed (usually needs ffmpeg, or an unsupported codec). */
+export class VideoMergeError extends Error {
+  code = "video_merge_failed" as const;
+  status = 502;
+  constructor(message: string) {
+    super(message);
+    this.name = "VideoMergeError";
   }
 }
 
@@ -344,6 +361,111 @@ export function buildExtractArgs(
   return args;
 }
 
+/**
+ * Build the yt-dlp video-extraction argv (pure — unit tested).
+ *
+ * Model-agnostic video for LLM input: only Gemini can be handed a YouTube
+ * URL, so every other video model needs a plain HTTPS .mp4 file. We pick a
+ * 720p H.264 + AAC stream pair and merge to mp4 with ffmpeg — the widest
+ * codec support across the cheap video models (qwen/glm/mimo/omni all take
+ * h264). Single yt-dlp call: ffmpeg is invoked by yt-dlp itself.
+ */
+export function buildVideoExtractArgs(
+  canonicalUrl: string,
+  outTemplate: string,
+  cookiesFile: string | null,
+  sectionArg: string | null,
+  maxHeight = 720
+): string[] {
+  const h = Math.round(maxHeight);
+  const args = [
+    "-f",
+    `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`,
+    "--merge-output-format",
+    "mp4",
+    "--no-playlist",
+    "--max-filesize",
+    "300M",
+    "--no-warnings",
+  ];
+  if (sectionArg) {
+    args.push("--download-sections", sectionArg, "--force-keyframes-at-cuts");
+  }
+  if (cookiesFile) args.push("--cookies", cookiesFile);
+  args.push("-o", outTemplate, canonicalUrl);
+  return args;
+}
+
+/**
+ * Download + merge a 720p mp4. Returns the absolute mp4 path.
+ * Throws BlockedError / TooLargeError / TimeoutError / VideoMergeError / Error.
+ */
+export async function runYtDlpVideoExtract(
+  canonicalUrl: string,
+  tmpDir: string,
+  cookiesFile: string | null,
+  sectionArg: string | null = null,
+  timeoutMs = YTDLP_VIDEO_TIMEOUT_MS,
+  maxHeight = 720
+): Promise<{ filepath: string; stdout: string; stderr: string }> {
+  const outTemplate = `${tmpDir}/%(id)s.%(ext)s`;
+  const args = buildVideoExtractArgs(canonicalUrl, outTemplate, cookiesFile, sectionArg, maxHeight);
+  logger.debug(
+    `[extract:video] start url=${canonicalUrl} tmpDir=${tmpDir} cookies=${cookiesFile ? "yes(path only)" : "no"} sections=${sectionArg ?? "none"}`
+  );
+  const started = Date.now();
+  const { code, stdout, stderr, timedOut } = await runCmd("yt-dlp", args, timeoutMs);
+  logger.debug(`[extract:video] yt-dlp done code=${code} timedOut=${timedOut} elapsedMs=${Date.now() - started}`);
+  const combined = `${stdout}\n${stderr}`;
+
+  if (timedOut) throw new TimeoutError(`video extract timed out after ${Math.round(timeoutMs / 1000)}s`);
+  if (isBlockedOutput(combined)) throw new BlockedError();
+  if (isTooLargeOutput(combined)) throw new TooLargeError("Video exceeds 300MB limit");
+  if (code !== 0) {
+    const low = combined.toLowerCase();
+    if (
+      low.includes("ffmpeg") ||
+      low.includes("merge") ||
+      low.includes("you have requested merging of multiple formats")
+    ) {
+      throw new VideoMergeError(
+        `yt-dlp could not produce an mp4: ${(stderr || stdout).slice(-800)}. The image must have ffmpeg installed.`
+      );
+    }
+    throw new Error(`yt-dlp video extract failed (exit ${code}): ${stderr.slice(-3000) || stdout.slice(-3000)}`);
+  }
+
+  const entries = await fs.readdir(tmpDir);
+  const mp4 = entries.filter((f) => f.toLowerCase().endsWith(".mp4")).sort();
+  logger.debug(
+    `[extract:video] tmp listing count=${entries.length} mp4=${mp4.length} files=${entries.slice(0, 10).join(",") || "none"}`
+  );
+  if (mp4.length === 0) {
+    throw new Error(
+      `yt-dlp finished but no .mp4 found in tmp dir (files: ${entries.join(", ") || "none"}). ` +
+        `The source may have no video+audio pair at 720p.`
+    );
+  }
+  // Take the largest mp4: that is the merged video+audio output, never a
+  // leftover single-stream fragment.
+  let filepath = `${tmpDir}/${mp4[0]}`;
+  {
+    let biggest = filepath;
+    let biggestSize = -1;
+    for (const f of mp4) {
+      const st = await fs.stat(`${tmpDir}/${f}`);
+      if (st.size > biggestSize) {
+        biggestSize = st.size;
+        biggest = `${tmpDir}/${f}`;
+      }
+    }
+    filepath = biggest;
+  }
+  const finalStat = await fs.stat(filepath);
+  logger.debug(`[extract:video] picked file=${filepath} sizeBytes=${finalStat.size} elapsedMs=${Date.now() - started}`);
+  return { filepath, stdout: stdout.slice(-4000), stderr: stderr.slice(-4000) };
+}
+
 export async function runYtDlpExtract(
   canonicalUrl: string,
   tmpDir: string,
@@ -422,4 +544,24 @@ export async function getMediaInfo(filepath: string): Promise<MediaInfo> {
   const durationSeconds = await probeDuration(filepath);
   logger.debug(`[ffprobe] file=${filepath} sizeBytes=${stat.size} durationSeconds=${durationSeconds}`);
   return { durationSeconds, sizeBytes: stat.size };
+}
+
+/**
+ * True when the file has at least one video stream. An audio-only source
+ * (or a failed merge) would otherwise be uploaded and fed to the model as
+ * a "video" it cannot see.
+ */
+export function hasVideoStream(filepath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(filepath, (err, metadata) => {
+      if (err) {
+        logger.debug(`[ffprobe] video-stream probe failed file=${filepath} err=${String(err).slice(0, 200)}`);
+        return resolve(false);
+      }
+      const streams = (metadata?.streams ?? []) as Array<{ codec_type?: string }>;
+      const has = streams.some((s) => s.codec_type === "video");
+      logger.debug(`[ffprobe] video-stream file=${filepath} streams=${streams.length} hasVideo=${has}`);
+      resolve(has);
+    });
+  });
 }

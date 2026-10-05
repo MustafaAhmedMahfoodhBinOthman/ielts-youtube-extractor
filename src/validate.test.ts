@@ -71,4 +71,14 @@ describe("buildFilename", () => {
     const f = buildFilename("x".repeat(200), "dQw4w9WgXcQ", 1);
     expect(f.startsWith(`${"x".repeat(80)}-dQw4w9WgXcQ-1.mp3`)).toBe(true);
   });
+
+  it("uses the mp4 extension for video jobs", () => {
+    expect(buildFilename("IELTS Reading 1", "dQw4w9WgXcQ", 1234567890000, "mp4")).toBe(
+      "ielts-reading-1-dQw4w9WgXcQ-1234567890000.mp4"
+    );
+  });
+
+  it("sanitizes a hostile extension", () => {
+    expect(buildFilename("t", "dQw4w9WgXcQ", 1, "../../mp4")).toBe("t-dQw4w9WgXcQ-1.mp4");
+  });
 });

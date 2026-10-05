@@ -12,14 +12,19 @@ import { InvalidUrlError, buildFilename, parseYoutubeUrl } from "./validate.js";
 import {
   BlockedError,
   MAX_FILE_BYTES,
+  MAX_VIDEO_FILE_BYTES,
+  MediaKind,
   RejectedError,
   TooLargeError,
   TimeoutError,
+  VideoMergeError,
   assertMetadataAllowed,
   getMediaInfo,
   getOembed,
   getYtDlpMetadata,
+  hasVideoStream,
   runYtDlpExtract,
+  runYtDlpVideoExtract,
 } from "./extract.js";
 import { tryRun } from "./queue.js";
 import { uploadToR2 } from "./r2.js";
@@ -135,6 +140,12 @@ const ExtractBody = z.object({
   title_hint: z.string().min(1).max(200).optional(),
   start_time: TimeInput.optional(),
   end_time: TimeInput.optional(),
+  // "audio" (default) = 128kbps mp3 for the listening test.
+  // "video" = 720p h264 mp4, needed by every LLM that cannot open a
+  // YouTube URL itself (only Gemini can).
+  kind: z.enum(["audio", "video"]).default("audio"),
+  // Cap the video height (video mode only). 720 keeps tokens low.
+  max_height: z.number().int().min(144).max(2160).optional(),
 });
 
 function redactUrlForLog(canonicalUrl: string): string {
@@ -205,7 +216,11 @@ app.get("/health", (_req, res) => {
 type JobStatus = "queued" | "running" | "done" | "failed";
 
 interface JobResult {
+  kind: MediaKind;
+  /** mp3 URL (kind=audio) or mp4 URL (kind=video). */
   audio_url: string;
+  /** Present only when kind=video: the same object, named explicitly. */
+  video_url?: string;
   r2Key: string;
   youtube_id: string;
   title: string;
@@ -229,6 +244,7 @@ interface Job {
   createdAt: number;
   youtube_id: string;
   title_hint?: string;
+  kind: MediaKind;
   result?: JobResult;
   error?: JobError;
 }
@@ -262,6 +278,9 @@ function toJobError(err: unknown): { status: number; body: JobError } {
   if (err instanceof TimeoutError) {
     return { status: err.status, body: { code: err.code, error: err.message } };
   }
+  if (err instanceof VideoMergeError) {
+    return { status: err.status, body: { code: err.code, error: err.message } };
+  }
   const message = err instanceof Error ? err.message.slice(0, 500) : "Extraction failed";
   const low = message.toLowerCase();
   if (low.includes("429") || low.includes("403") || low.includes("sign in to confirm")) {
@@ -286,7 +305,9 @@ async function runExtraction(
   videoId: string,
   canonicalUrl: string,
   title_hint: string | undefined,
-  range: ParsedRange
+  range: ParsedRange,
+  kind: MediaKind,
+  maxHeight?: number
 ): Promise<JobResult> {
   const jobStarted = Date.now();
   const trimming = range.startSeconds > 0 || range.endSeconds !== null;
@@ -310,10 +331,13 @@ async function runExtraction(
     // Trim at fetch time (Option A): yt-dlp downloads only the section.
     const sectionArg = buildSectionArg(range);
     logger.debug(`[job ${jobId}] stage=sections trimming=${trimming} arg=${sectionArg ?? "none"}`);
-    // Extract mp3 (240s timeout inside)
+    // Extract media (240s audio / 600s video timeout inside)
     const tExtract = Date.now();
-    const { filepath } = await runYtDlpExtract(canonicalUrl, tmpDir, cookiesFile, undefined, sectionArg);
-    logger.debug(`[job ${jobId}] stage=extract elapsedMs=${Date.now() - tExtract} file=${filepath}`);
+    const { filepath } =
+      kind === "video"
+        ? await runYtDlpVideoExtract(canonicalUrl, tmpDir, cookiesFile, sectionArg, undefined, maxHeight)
+        : await runYtDlpExtract(canonicalUrl, tmpDir, cookiesFile, undefined, sectionArg);
+    logger.debug(`[job ${jobId}] stage=extract kind=${kind} elapsedMs=${Date.now() - tExtract} file=${filepath}`);
 
     // Verify: exists, size, ffprobe duration
     const tVerify = Date.now();
@@ -321,11 +345,20 @@ async function runExtraction(
     logger.debug(
       `[job ${jobId}] stage=verify elapsedMs=${Date.now() - tVerify} sizeBytes=${info.sizeBytes} durationSeconds=${info.durationSeconds}`
     );
-    if (info.sizeBytes > MAX_FILE_BYTES) {
-      throw new TooLargeError(`Audio is ${(info.sizeBytes / 1024 / 1024).toFixed(1)}MB, exceeds 100MB limit`);
+    const sizeCap = kind === "video" ? MAX_VIDEO_FILE_BYTES : MAX_FILE_BYTES;
+    const sizeCapMb = Math.round(sizeCap / 1024 / 1024);
+    if (info.sizeBytes > sizeCap) {
+      throw new TooLargeError(
+        `${kind === "video" ? "Video" : "Audio"} is ${(info.sizeBytes / 1024 / 1024).toFixed(1)}MB, exceeds ${sizeCapMb}MB limit`
+      );
     }
     if (info.sizeBytes < 10_000) {
       throw new Error(`Extracted file suspiciously small (${info.sizeBytes} bytes) — likely failed download`);
+    }
+    // Video must actually contain a video stream — a silent/merged-to-audio
+    // file would be fed to the model as a broken "video".
+    if (kind === "video" && !(await hasVideoStream(filepath))) {
+      throw new VideoMergeError("Extracted mp4 has no video stream (audio-only source?) — cannot be used as model video input");
     }
     // Trim check: probed duration must match the requested section (±5s).
     // Never silently upload the wrong (untrimmed) file.
@@ -350,16 +383,18 @@ async function runExtraction(
 
     // Prefer title_hint for the filename slug when provided, fall back to resolved title
     const slugBase = (title_hint && title_hint.trim()) || title;
-    const filename = buildFilename(slugBase, videoId);
+    const filename = buildFilename(slugBase, videoId, Date.now(), kind === "video" ? "mp4" : "mp3");
     logger.debug(`[job ${jobId}] stage=filename file=${filename}`);
 
     // Upload to R2 (streamed)
     const tUpload = Date.now();
-    const { r2Key, audioUrl } = await uploadToR2(filepath, filename);
+    const { r2Key, url } = await uploadToR2(filepath, filename, kind);
     logger.debug(`[job ${jobId}] stage=upload elapsedMs=${Date.now() - tUpload} r2Key=${r2Key}`);
 
     const result: JobResult = {
-      audio_url: audioUrl,
+      kind,
+      audio_url: url,
+      ...(kind === "video" ? { video_url: url } : {}),
       r2Key,
       youtube_id: videoId,
       title,
@@ -396,6 +431,8 @@ function parseExtractInput(body: unknown):
       title_hint?: string;
       start_time?: number | string;
       end_time?: number | string;
+      kind: MediaKind;
+      max_height?: number;
     }
   | { ok: false; status: number; body: Record<string, unknown> } {
   const parsed = ExtractBody.safeParse(body);
@@ -406,7 +443,7 @@ function parseExtractInput(body: unknown):
       body: {
         success: false,
         code: "invalid_url",
-        error: "Body must be { youtube_url: string, title_hint?: string, start_time?: seconds|mm:ss|hh:mm:ss, end_time?: ... }",
+        error: "Body must be { youtube_url: string, title_hint?: string, start_time?: seconds|mm:ss|hh:mm:ss, end_time?: ..., kind?: 'audio'|'video', max_height?: number }",
         details: parsed.error.issues.map((i) => ({ path: i.path, message: i.message })).slice(0, 5),
       },
     };
@@ -420,6 +457,8 @@ function parseExtractInput(body: unknown):
       title_hint: parsed.data.title_hint,
       start_time: parsed.data.start_time,
       end_time: parsed.data.end_time,
+      kind: parsed.data.kind,
+      max_height: parsed.data.max_height,
     };
   } catch (err) {
     const message = err instanceof InvalidUrlError ? err.message : "Invalid YouTube URL";
@@ -436,8 +475,8 @@ app.post("/extract", authMiddleware, async (req, res) => {
     res.status(input.status).json(input.body);
     return;
   }
-  const { videoId, canonicalUrl, title_hint } = input;
-  logger.debug(`[extract] input videoId=${videoId} hint=${title_hint ? "yes" : "no"}`);
+  const { videoId, canonicalUrl, title_hint, kind, max_height } = input;
+  logger.debug(`[extract] input videoId=${videoId} kind=${kind} maxHeight=${max_height ?? "default"} hint=${title_hint ? "yes" : "no"}`);
   let range: ParsedRange;
   try {
     range = parseTimeRange(input.start_time, input.end_time);
@@ -450,14 +489,14 @@ app.post("/extract", authMiddleware, async (req, res) => {
     throw err;
   }
   const wait = req.query.wait === "true";
-  logger.debug(`[extract] mode=${wait ? "sync(wait=true)" : "async"} videoId=${videoId}`);
+  logger.debug(`[extract] mode=${wait ? "sync(wait=true)" : "async"} videoId=${videoId} kind=${kind}`);
 
   // Local-dev synchronous path: request waits 30-120s for the result.
   if (wait) {
     const jobId = uuidv4();
-    logger.info(`[job ${jobId}] sync start ${redactUrlForLog(canonicalUrl)}`);
+    logger.info(`[job ${jobId}] sync start kind=${kind} ${redactUrlForLog(canonicalUrl)}`);
     // Atomic admission (no await between busy-check and dispatch — see queue.ts).
-    const p = tryRun(() => runExtraction(jobId, videoId, canonicalUrl, title_hint, range));
+    const p = tryRun(() => runExtraction(jobId, videoId, canonicalUrl, title_hint, range, kind, max_height));
     if (!p) {
       logger.debug(`[job ${jobId}] sync reject busy videoId=${videoId}`);
       res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
@@ -484,13 +523,14 @@ app.post("/extract", authMiddleware, async (req, res) => {
     createdAt: Date.now(),
     youtube_id: videoId,
     title_hint,
+    kind,
   };
   // Atomic admission before promising anything.
   const p = tryRun(async () => {
     job.status = "running";
-    logger.info(`[job ${job.id}] start ${redactUrlForLog(canonicalUrl)}`);
+    logger.info(`[job ${job.id}] start kind=${kind} ${redactUrlForLog(canonicalUrl)}`);
     try {
-      const result = await runExtraction(job.id, videoId, canonicalUrl, title_hint, range);
+      const result = await runExtraction(job.id, videoId, canonicalUrl, title_hint, range, kind, max_height);
       job.status = "done";
       job.result = result;
       logger.info(`[job ${job.id}] done ${videoId} -> ${result.r2Key} (${result.size} bytes)`);
@@ -530,6 +570,7 @@ app.get("/job/:id", authMiddleware, (req, res) => {
     jobId: job.id,
     status: job.status,
     youtube_id: job.youtube_id,
+    kind: job.kind,
     ...(job.result ? { result: job.result } : {}),
     ...(job.error ? { error: job.error } : {}),
   });

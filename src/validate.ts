@@ -101,9 +101,15 @@ export function sanitizeSlug(input: string): string {
 }
 
 /**
- * {sanitized-title-or-title_hint}-{youtube_id}-{Date.now()}.mp3
+ * {sanitized-title-or-title_hint}-{youtube_id}-{Date.now()}.{ext}
  */
-export function buildFilename(baseTitle: string, youtubeId: string, now = Date.now()): string {
-  const slug = sanitizeSlug(baseTitle).slice(0, 80) || "audio";
-  return `${slug}-${youtubeId}-${now}.mp3`;
+export function buildFilename(
+  baseTitle: string,
+  youtubeId: string,
+  now = Date.now(),
+  ext = "mp3"
+): string {
+  const slug = sanitizeSlug(baseTitle).slice(0, 80) || "media";
+  const cleanExt = ext.replace(/[^a-z0-9]/gi, "").toLowerCase() || "mp3";
+  return `${slug}-${youtubeId}-${now}.${cleanExt}`;
 }

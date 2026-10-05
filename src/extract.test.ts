@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { assertMetadataAllowed, buildExtractArgs, parseMetadataPrint } from "./extract.js";
+import {
+  assertMetadataAllowed,
+  buildExtractArgs,
+  buildVideoExtractArgs,
+  parseMetadataPrint,
+} from "./extract.js";
 import { RejectedError } from "./extract.js";
 
 const NORMAL = [
@@ -94,5 +99,34 @@ describe("buildExtractArgs", () => {
     expect(args).not.toContain("--force-keyframes-at-cuts");
     expect(args).toContain("--cookies");
     expect(args.slice(-3)).toEqual(["-o", "tmpl", "url"]);
+  });
+});
+
+describe("buildVideoExtractArgs", () => {
+  it("requests a capped-height mp4+audio pair merged to mp4", () => {
+    const args = buildVideoExtractArgs("url", "tmpl", null, null);
+    const fmt = args[args.indexOf("-f") + 1];
+    // Every fallback branch is height-capped: an unbounded `best` branch would
+    // silently pull 4K and blow up the model's token bill.
+    expect(fmt).toContain("height<=720");
+    for (const branch of fmt.split("/")) expect(branch).toContain("height<=720");
+    expect(args[args.indexOf("--merge-output-format") + 1]).toBe("mp4");
+    // mp3 extraction flags must NOT leak into the video path.
+    expect(args).not.toContain("-x");
+    expect(args).not.toContain("--audio-format");
+    expect(args[args.indexOf("--max-filesize") + 1]).toBe("300M");
+    expect(args.slice(-3)).toEqual(["-o", "tmpl", "url"]);
+  });
+
+  it("honours a custom max height", () => {
+    const args = buildVideoExtractArgs("url", "tmpl", null, null, 480);
+    expect(args[args.indexOf("-f") + 1]).toContain("height<=480");
+  });
+
+  it("adds section-cut flags and cookies when trimming", () => {
+    const args = buildVideoExtractArgs("url", "tmpl", "/tmp/cookies.txt", "*0:00:10-0:02:00");
+    expect(args[args.indexOf("--download-sections") + 1]).toBe("*0:00:10-0:02:00");
+    expect(args).toContain("--force-keyframes-at-cuts");
+    expect(args).toContain("--cookies");
   });
 });

@@ -181,6 +181,28 @@ export function isTooLargeOutput(text: string): boolean {
   return t.includes("larger than max-filesize") || t.includes("max-filesize") || t.includes("file is larger than");
 }
 
+/**
+ * Bound yt-dlp's own retry behaviour.
+ *
+ * yt-dlp defaults to ~10 extraction retries and ~10 fragment retries with
+ * exponential backoff. When YouTube blocks the host IP (429/403 — routine
+ * for a datacentre IP with no cookies), every one of those retries is a
+ * guaranteed failure, so a request that is dead in one second instead hangs
+ * until our own timeout expires: the admin waits 4 minutes to be told
+ * "timed out" instead of "blocked". Two quick retries plus a short socket
+ * timeout surface the real 429 in seconds.
+ */
+const BOUNDED_RETRY_ARGS = [
+  "--socket-timeout",
+  "15",
+  "--retries",
+  "2",
+  "--fragment-retries",
+  "2",
+  "--retry-sleep",
+  "linear",
+] as const;
+
 /** Field order for the `--print` metadata fetch. Must match the args below. */
 const META_PRINT_ORDER = [
   "title",
@@ -355,6 +377,7 @@ export function buildExtractArgs(
     "--max-filesize",
     "100M",
     "--no-warnings",
+    ...BOUNDED_RETRY_ARGS,
   ];
   if (sectionArg) {
     args.push(
@@ -407,6 +430,7 @@ export function buildVideoExtractArgs(
     "--max-filesize",
     "300M",
     "--no-warnings",
+    ...BOUNDED_RETRY_ARGS,
   ];
   if (cookiesFile) args.push("--cookies", cookiesFile);
   args.push("-o", outTemplate, canonicalUrl);

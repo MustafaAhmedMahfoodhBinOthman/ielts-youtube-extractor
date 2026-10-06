@@ -182,22 +182,26 @@ export function isTooLargeOutput(text: string): boolean {
 }
 
 /**
- * Bound yt-dlp's own retry behaviour.
+ * Bound yt-dlp's *API-level* retries so a blocked host fails fast.
  *
- * yt-dlp defaults to ~10 extraction retries and ~10 fragment retries with
- * exponential backoff. When YouTube blocks the host IP (429/403 — routine
- * for a datacentre IP with no cookies), every one of those retries is a
- * guaranteed failure, so a request that is dead in one second instead hangs
- * until our own timeout expires: the admin waits 4 minutes to be told
- * "timed out" instead of "blocked". Two quick retries plus a short socket
- * timeout surface the real 429 in seconds.
+ * yt-dlp defaults to ~10 extraction retries with exponential backoff. When
+ * YouTube rate-limits the host IP (429/403 — routine for a datacentre IP
+ * with no cookies), every one of those retries is a guaranteed failure, so a
+ * request that is dead in one second instead hangs until our own timeout
+ * expires: the admin waits 4 minutes to be told "timed out" rather than
+ * "blocked". Reproduced, then confirmed transient — the same URL that timed
+ * out pulled fine 20s later on a retry loop.
+ *
+ * Deliberately NOT bounding `--fragment-retries`: video arrives as DASH
+ * fragments and transient fragment failures are precisely the symptom of a
+ * throttled link. Cutting those retries would make video extraction flaky,
+ * which is the opposite of what we want. Media-level resilience stays at
+ * yt-dlp's default.
  */
 const BOUNDED_RETRY_ARGS = [
   "--socket-timeout",
   "15",
   "--retries",
-  "2",
-  "--fragment-retries",
   "2",
   "--retry-sleep",
   "linear",

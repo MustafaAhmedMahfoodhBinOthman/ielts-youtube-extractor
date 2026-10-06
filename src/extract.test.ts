@@ -133,11 +133,12 @@ describe("buildVideoExtractArgs", () => {
     expect(args).not.toContain("-x");
     expect(args).not.toContain("--audio-format");
     expect(args[args.indexOf("--max-filesize") + 1]).toBe("300M");
-    // Bounded retries: a 429-blocked host must fail fast, not hang for the
-    // full timeout while yt-dlp works through its default ~10 retries.
+    // Bounded API retries: a 429-blocked host must fail fast rather than
+    // hang for the full timeout. Fragment retries stay at yt-dlp's default
+    // on purpose — DASH video needs that resilience on a throttled link.
     expect(args[args.indexOf("--retries") + 1]).toBe("2");
-    expect(args[args.indexOf("--fragment-retries") + 1]).toBe("2");
     expect(args[args.indexOf("--socket-timeout") + 1]).toBe("15");
+    expect(args).not.toContain("--fragment-retries");
     expect(args.slice(-3)).toEqual(["-o", "tmpl", "url"]);
   });
 

@@ -313,8 +313,12 @@ failures).
 
 ### `GET /job/:id`
 
-Auth required. Returns `{status: queued|running|done|failed, result|error}`.
-Unknown/expired id → 404 `not_found`. Use for Trigger.dev polling: submit
+Auth required. Returns `{status: queued|running|done|failed, stage?, result|error}`.
+`stage` is the current phase (`queued`, `downloading audio`, `probing audio`,
+`cutting audio`, `verifying cut`, `uploading to R2`, or the `/extract`
+equivalents `fetching metadata`, `downloading section`, `extracting audio`,
+`verifying`, `uploading to R2`) — poll it for live "what is happening now"
+status. Unknown/expired id → 404 `not_found`. Use for Trigger.dev polling: submit
 via `POST /extract`, poll `GET /job/:id` until `done`/`failed`.
 
 ## Error codes

@@ -28,6 +28,7 @@ import {
 } from "./extract.js";
 import { tryRun } from "./queue.js";
 import { uploadToR2 } from "./r2.js";
+import { clearStage, getStage, setStage } from "./stages.js";
 import {
   InvalidAudioUrlError,
   buildAudioCutFilename,
@@ -287,6 +288,7 @@ function scheduleJobCleanup(jobId: string): void {
   logger.debug(`[job ${jobId}] ttl scheduled ttlMs=${JOB_TTL_MS}`);
   const t = setTimeout(() => {
     const existed = jobs.delete(jobId);
+    clearStage(jobId);
     logger.debug(`[job ${jobId}] ttl expired removed=${existed}`);
   }, JOB_TTL_MS);
   // Don't hold the process open for cleanup timers in tests/dev.
@@ -356,6 +358,7 @@ async function runExtraction(
   logger.debug(`[job ${jobId}] tmp ready dir=${tmpDir}`);
   try {
     // oEmbed (best-effort) + yt-dlp metadata (authoritative for duration/restrictions)
+    setStage(jobId, "fetching metadata");
     const tMeta = Date.now();
     const [oembed, meta] = await Promise.all([getOembed(videoId), getYtDlpMetadata(canonicalUrl, cookiesFile)]);
     logger.debug(`[job ${jobId}] stage=metadata elapsedMs=${Date.now() - tMeta} oembedTitle=${oembed.title ? "yes" : "no"}`);
@@ -373,6 +376,7 @@ async function runExtraction(
     logger.debug(`[job ${jobId}] stage=sections trimming=${trimming} arg=${sectionArg ?? "none"}`);
     // Extract media (240s audio / 600s video timeout inside)
     const tExtract = Date.now();
+    setStage(jobId, trimming ? "downloading section" : kind === "video" ? "downloading video" : "extracting audio");
     const { filepath } =
       kind === "video"
         ? await runYtDlpVideoExtract(canonicalUrl, tmpDir, cookiesFile, maxHeight)
@@ -381,6 +385,7 @@ async function runExtraction(
 
     // Verify: exists, size, ffprobe duration
     const tVerify = Date.now();
+    setStage(jobId, "verifying");
     const info = await getMediaInfo(filepath);
     logger.debug(
       `[job ${jobId}] stage=verify elapsedMs=${Date.now() - tVerify} sizeBytes=${info.sizeBytes} durationSeconds=${info.durationSeconds}`
@@ -428,6 +433,7 @@ async function runExtraction(
 
     // Upload to R2 (streamed)
     const tUpload = Date.now();
+    setStage(jobId, "uploading to R2");
     const { r2Key, url } = await uploadToR2(filepath, filename, kind);
     logger.debug(`[job ${jobId}] stage=upload elapsedMs=${Date.now() - tUpload} r2Key=${r2Key}`);
 
@@ -487,10 +493,12 @@ async function runAudioCut(
   logger.debug(`[job ${jobId}] audio-cut tmp ready dir=${tmpDir} trimming=${trimming}`);
   try {
     const tDl = Date.now();
+    setStage(jobId, "downloading audio");
     const downloaded = await downloadAudioToFile(audioUrl, tmpDir);
     logger.debug(`[job ${jobId}] stage=download elapsedMs=${Date.now() - tDl} sizeBytes=${downloaded.sizeBytes}`);
 
     const tProbe = Date.now();
+    setStage(jobId, "probing audio");
     const fullInfo = await getMediaInfo(downloaded.filepath);
     logger.debug(
       `[job ${jobId}] stage=probe elapsedMs=${Date.now() - tProbe} durationSeconds=${fullInfo.durationSeconds}`
@@ -501,6 +509,7 @@ async function runAudioCut(
     if (trimming) {
       const outPath = path.join(tmpDir, `cut-${Date.now()}.mp3`);
       const tCut = Date.now();
+      setStage(jobId, "cutting audio");
       await cutMp3(downloaded.filepath, outPath, range.startSeconds, range.endSeconds);
       logger.debug(`[job ${jobId}] stage=cut elapsedMs=${Date.now() - tCut} out=${outPath}`);
       cutPath = outPath;
@@ -508,6 +517,7 @@ async function runAudioCut(
 
     // Verify the cut: probed duration must match the requested section (±5s).
     const tVerify = Date.now();
+    setStage(jobId, "verifying cut");
     const info = await getMediaInfo(cutPath);
     logger.debug(
       `[job ${jobId}] stage=verify elapsedMs=${Date.now() - tVerify} sizeBytes=${info.sizeBytes} durationSeconds=${info.durationSeconds}`
@@ -542,6 +552,7 @@ async function runAudioCut(
     logger.debug(`[job ${jobId}] stage=filename file=${filename}`);
 
     const tUpload = Date.now();
+    setStage(jobId, "uploading to R2");
     const { r2Key, url } = await uploadToR2(cutPath, filename, "audio", "practice");
     logger.debug(`[job ${jobId}] stage=upload elapsedMs=${Date.now() - tUpload} r2Key=${r2Key}`);
 
@@ -713,6 +724,7 @@ app.post("/extract", authMiddleware, async (req, res) => {
     return;
   }
   jobs.set(job.id, job);
+  setStage(job.id, "queued");
   scheduleJobCleanup(job.id);
   // Surface background failures (already recorded on the job) without crashing.
   p.catch(() => undefined);
@@ -729,10 +741,12 @@ app.get("/job/:id", authMiddleware, (req, res) => {
     return;
   }
   logger.debug(`[job ${job.id}] poll status=${job.status}`);
+  const stage = getStage(job.id)
   res.json({
     success: true,
     jobId: job.id,
     status: job.status,
+    ...(stage ? { stage } : {}),
     youtube_id: job.youtube_id,
     kind: job.kind,
     ...(job.source ? { source: job.source } : {}),
@@ -840,6 +854,7 @@ app.post("/audio-cut", authMiddleware, async (req, res) => {
     return;
   }
   jobs.set(job.id, job);
+  setStage(job.id, "queued");
   scheduleJobCleanup(job.id);
   p.catch(() => undefined);
   logger.debug(`[job ${job.id}] accepted audio-cut status=${job.status}`);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { InvalidAudioUrlError, buildAudioCutFilename, validateAudioUrl } from "./audio-cut.js";
+import { InvalidAudioUrlError, buildAudioCutFilename, buildAudioProxyFilename, validateAudioUrl } from "./audio-cut.js";
 
 describe("validateAudioUrl", () => {
   it("rejects empty input", async () => {
@@ -45,5 +45,11 @@ describe("buildAudioCutFilename", () => {
 
   it("falls back to audio for empty hints", () => {
     expect(buildAudioCutFilename("   ", 1)).toBe("audio-onecut-1.mp3");
+  });
+
+  it("builds full-proxy filenames with -full- infix", () => {
+    expect(buildAudioProxyFilename("OneIELTS Listening Test 12", 1234567890)).toBe(
+      "oneielts-listening-test-12-full-1234567890.mp3"
+    );
   });
 });

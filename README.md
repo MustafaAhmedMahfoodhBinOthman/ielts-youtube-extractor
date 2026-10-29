@@ -255,6 +255,26 @@ done; wait
 # (automated equivalent: npm test — queue.test.ts asserts 2 run / 3 rejected)
 ```
 
+### `POST /audio-proxy`
+
+Full-file proxy: hosted audio URL → R2, **no cutting**. Same shape as
+`/audio-cut` (async `202 + poll GET /job/:id`, `?wait=true` sync, same
+auth/queue/stages) for the web app's "proxy original audio" step, so the
+panel can show live progress (`downloading audio → probing audio →
+uploading to R2`) instead of a blind wait:
+
+```bash
+curl -s -X POST https://<app-url>/audio-proxy \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"audio_url":"https://.../listening-test.mp3","title_hint":"oneielts-1444"}'
+# -> 202 {success:true,jobId:"...",status:"queued"} (poll GET /job/:id)
+```
+
+Pipeline: URL validated (same SSRF guard as `/audio-cut`) → stream-download
+(120s, 100MB cap) → `ffprobe` duration/size check → R2 upload under
+`practice/{slug}-full-{Date.now()}.mp3`. Body and error codes mirror
+`/audio-cut` minus the range fields.
+
 ### `POST /audio-cut`
 
 Generic hosted-audio cutter for OneIELTS (and any public mp3) — **separate

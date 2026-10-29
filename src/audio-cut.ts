@@ -211,3 +211,9 @@ export function buildAudioCutFilename(baseTitle: string, now = Date.now()): stri
   const slug = sanitizeSlug(baseTitle).slice(0, 80) || "audio";
   return `${slug}-onecut-${now}.mp3`;
 }
+
+/** Full-file proxy filename (no cut): {slug}-full-{now}.mp3 */
+export function buildAudioProxyFilename(baseTitle: string, now = Date.now()): string {
+  const slug = sanitizeSlug(baseTitle).slice(0, 80) || "audio";
+  return `${slug}-full-${now}.mp3`;
+}

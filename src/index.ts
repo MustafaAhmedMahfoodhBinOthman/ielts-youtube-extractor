@@ -32,6 +32,7 @@ import { clearStage, getStage, setStage } from "./stages.js";
 import {
   InvalidAudioUrlError,
   buildAudioCutFilename,
+  buildAudioProxyFilename,
   cutMp3,
   downloadAudioToFile,
   validateAudioUrl,
@@ -165,6 +166,13 @@ const AudioCutBody = z.object({
   end_time: TimeInput.optional(),
 });
 
+// POST /audio-proxy body: full-file proxy (OneIELTS CDN -> R2), no cutting.
+// Gives the web app's proxy step the same async + live-stage treatment as cuts.
+const AudioProxyBody = z.object({
+  audio_url: z.string().min(1).max(4000),
+  title_hint: z.string().min(1).max(200).optional(),
+});
+
 function redactUrlForLog(canonicalUrl: string): string {
   return canonicalUrl; // YouTube watch URLs are not secrets
 }
@@ -244,7 +252,7 @@ type JobStatus = "queued" | "running" | "done" | "failed";
 interface JobResult {
   kind: MediaKind;
   /** youtube (/extract) vs audio-cut (/audio-cut). */
-  source?: "youtube" | "audio-cut";
+  source?: "youtube" | "audio-cut" | "audio-proxy";
   /** mp3 URL (kind=audio) or mp4 URL (kind=video). */
   audio_url: string;
   /** Present only when kind=video: the same object, named explicitly. */
@@ -272,7 +280,7 @@ interface Job {
   createdAt: number;
   youtube_id: string;
   /** youtube (/extract) vs audio-cut (/audio-cut). */
-  source: "youtube" | "audio-cut";
+  source: "youtube" | "audio-cut" | "audio-proxy";
   /** Present only for audio-cut jobs: the caller-supplied source URL. */
   audio_url?: string;
   title_hint?: string;
@@ -589,6 +597,73 @@ async function runAudioCut(
   }
 }
 
+/**
+ * Audio-proxy core: download a hosted audio file -> verify -> R2, no cutting.
+ * Same async job pattern as audio-cut so the caller gets live stages.
+ */
+async function runAudioProxy(
+  jobId: string,
+  audioUrl: string,
+  title_hint: string | undefined
+): Promise<JobResult> {
+  const jobStarted = Date.now();
+  const tmpDir = path.join(os.tmpdir(), `proxy-${jobId}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+  logger.debug(`[job ${jobId}] audio-proxy tmp ready dir=${tmpDir}`);
+  try {
+    const tDl = Date.now();
+    setStage(jobId, "downloading audio");
+    const downloaded = await downloadAudioToFile(audioUrl, tmpDir);
+    logger.debug(`[job ${jobId}] stage=download elapsedMs=${Date.now() - tDl} sizeBytes=${downloaded.sizeBytes}`);
+
+    const tProbe = Date.now();
+    setStage(jobId, "probing audio");
+    const fullInfo = await getMediaInfo(downloaded.filepath);
+    logger.debug(
+      `[job ${jobId}] stage=probe elapsedMs=${Date.now() - tProbe} durationSeconds=${fullInfo.durationSeconds}`
+    );
+    if (fullInfo.sizeBytes > MAX_FILE_BYTES) {
+      throw new TooLargeError(`Audio is ${(fullInfo.sizeBytes / 1024 / 1024).toFixed(1)}MB, exceeds 100MB limit`);
+    }
+    if (fullInfo.sizeBytes < 10_000) {
+      throw new Error(`Downloaded audio suspiciously small (${fullInfo.sizeBytes} bytes) — likely not an audio file`);
+    }
+
+    const slugBase = (title_hint && title_hint.trim()) || "oneielts-audio";
+    const filename = buildAudioProxyFilename(slugBase, Date.now());
+    logger.debug(`[job ${jobId}] stage=filename file=${filename}`);
+
+    const tUpload = Date.now();
+    setStage(jobId, "uploading to R2");
+    const { r2Key, url } = await uploadToR2(downloaded.filepath, filename, "audio", "practice");
+    logger.debug(`[job ${jobId}] stage=upload elapsedMs=${Date.now() - tUpload} r2Key=${r2Key}`);
+
+    const result: JobResult = {
+      kind: "audio",
+      source: "audio-proxy",
+      audio_url: url,
+      r2Key,
+      youtube_id: "audio-proxy",
+      title: slugBase.trim().slice(0, 200) || "oneielts-audio",
+      duration_seconds: fullInfo.durationSeconds != null ? Math.round(fullInfo.durationSeconds) : null,
+      size: fullInfo.sizeBytes,
+      trimmed: false,
+      start_seconds: null,
+      end_seconds: null,
+      original_duration_seconds: fullInfo.durationSeconds != null ? Math.round(fullInfo.durationSeconds) : null,
+    };
+    logger.debug(`[job ${jobId}] stage=result totalElapsedMs=${Date.now() - jobStarted} size=${result.size}`);
+    return result;
+  } finally {
+    try {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+      logger.debug(`[job ${jobId}] tmp cleaned dir=${tmpDir}`);
+    } catch (err) {
+      logger.warn(`[job ${jobId}] tmp cleanup failed dir=${tmpDir} err=${String(err).slice(0, 150)}`);
+    }
+  }
+}
+
 function parseExtractInput(body: unknown):
   | {
       ok: true;
@@ -729,6 +804,93 @@ app.post("/extract", authMiddleware, async (req, res) => {
   // Surface background failures (already recorded on the job) without crashing.
   p.catch(() => undefined);
   logger.debug(`[job ${job.id}] accepted status=${job.status} videoId=${videoId}`);
+  res.status(202).json({ success: true, jobId: job.id, status: job.status });
+});
+
+// --- POST /audio-proxy: full-file proxy (hosted audio -> R2), no cutting ---
+// Same async job pattern as /audio-cut (202 + poll GET /job/:id, ?wait=true sync).
+app.post("/audio-proxy", authMiddleware, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  const parsed = AudioProxyBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      code: "invalid_url",
+      error: "Body must be { audio_url: string, title_hint?: string }",
+      details: parsed.error.issues.map((i) => ({ path: i.path, message: i.message })).slice(0, 5),
+    });
+    return;
+  }
+  const { audio_url, title_hint } = parsed.data;
+  try {
+    await validateAudioUrl(audio_url);
+  } catch (err) {
+    if (err instanceof InvalidAudioUrlError) {
+      logger.debug(`[audio-proxy] reject url: ${err.message}`);
+      res.status(err.status).json({ success: false, code: err.code, error: err.message });
+      return;
+    }
+    throw err;
+  }
+  const wait = req.query.wait === "true";
+  logger.debug(`[audio-proxy] mode=${wait ? "sync(wait=true)" : "async"} url host=${safeHost(audio_url)}`);
+
+  if (wait) {
+    const jobId = uuidv4();
+    logger.info(`[job ${jobId}] audio-proxy sync start host=${safeHost(audio_url)}`);
+    const p = tryRun(() => runAudioProxy(jobId, audio_url, title_hint));
+    if (!p) {
+      res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
+      return;
+    }
+    try {
+      const result = await p;
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ success: true, ...result });
+      logger.info(`[job ${jobId}] audio-proxy sync done -> ${result.r2Key} (${result.size} bytes)`);
+    } catch (err) {
+      const mapped = toJobError(err);
+      if (mapped.status >= 500) logger.error(`[job ${jobId}] audio-proxy sync failed:`, mapped.body.error.slice(0, 300));
+      res.status(mapped.status).json({ success: false, ...mapped.body });
+    }
+    return;
+  }
+
+  const job: Job = {
+    id: uuidv4(),
+    status: "queued",
+    createdAt: Date.now(),
+    youtube_id: "audio-proxy",
+    source: "audio-proxy",
+    audio_url,
+    title_hint,
+    kind: "audio",
+  };
+  const p = tryRun(async () => {
+    job.status = "running";
+    logger.info(`[job ${job.id}] audio-proxy start host=${safeHost(audio_url)}`);
+    try {
+      const result = await runAudioProxy(job.id, audio_url, title_hint);
+      job.status = "done";
+      job.result = result;
+      logger.info(`[job ${job.id}] audio-proxy done -> ${result.r2Key} (${result.size} bytes)`);
+    } catch (err) {
+      const mapped = toJobError(err);
+      job.status = "failed";
+      job.error = mapped.body;
+      if (mapped.status >= 500) logger.error(`[job ${job.id}] audio-proxy failed:`, mapped.body.error.slice(0, 300));
+      else logger.info(`[job ${job.id}] audio-proxy failed: ${mapped.body.code}`);
+    }
+  });
+  if (!p) {
+    res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
+    return;
+  }
+  jobs.set(job.id, job);
+  setStage(job.id, "queued");
+  scheduleJobCleanup(job.id);
+  p.catch(() => undefined);
   res.status(202).json({ success: true, jobId: job.id, status: job.status });
 });
 

@@ -28,6 +28,13 @@ import {
 } from "./extract.js";
 import { tryRun } from "./queue.js";
 import { uploadToR2 } from "./r2.js";
+import {
+  InvalidAudioUrlError,
+  buildAudioCutFilename,
+  cutMp3,
+  downloadAudioToFile,
+  validateAudioUrl,
+} from "./audio-cut.js";
 import { LOG_LEVEL, logger } from "./logger.js";
 import {
   InvalidRangeError,
@@ -148,8 +155,26 @@ const ExtractBody = z.object({
   max_height: z.number().int().min(144).max(2160).optional(),
 });
 
+// POST /audio-cut body: generic hosted-audio cutter (OneIELTS CDN, R2, …).
+// Separate from /extract: no YouTube involved, just download -> cut -> R2.
+const AudioCutBody = z.object({
+  audio_url: z.string().min(1).max(4000),
+  title_hint: z.string().min(1).max(200).optional(),
+  start_time: TimeInput.optional(),
+  end_time: TimeInput.optional(),
+});
+
 function redactUrlForLog(canonicalUrl: string): string {
   return canonicalUrl; // YouTube watch URLs are not secrets
+}
+
+/** Host-only for audio-cut logs (full audio URLs may carry signed query params). */
+function safeHost(rawUrl: string): string {
+  try {
+    return new URL(rawUrl).hostname;
+  } catch {
+    return "unparseable";
+  }
 }
 
 const app = express();
@@ -217,6 +242,8 @@ type JobStatus = "queued" | "running" | "done" | "failed";
 
 interface JobResult {
   kind: MediaKind;
+  /** youtube (/extract) vs audio-cut (/audio-cut). */
+  source?: "youtube" | "audio-cut";
   /** mp3 URL (kind=audio) or mp4 URL (kind=video). */
   audio_url: string;
   /** Present only when kind=video: the same object, named explicitly. */
@@ -243,6 +270,10 @@ interface Job {
   status: JobStatus;
   createdAt: number;
   youtube_id: string;
+  /** youtube (/extract) vs audio-cut (/audio-cut). */
+  source: "youtube" | "audio-cut";
+  /** Present only for audio-cut jobs: the caller-supplied source URL. */
+  audio_url?: string;
   title_hint?: string;
   kind: MediaKind;
   result?: JobResult;
@@ -263,7 +294,7 @@ function scheduleJobCleanup(jobId: string): void {
 }
 
 function toJobError(err: unknown): { status: number; body: JobError } {
-  if (err instanceof InvalidRangeError) {
+  if (err instanceof InvalidRangeError || err instanceof InvalidAudioUrlError) {
     return { status: err.status, body: { code: err.code, error: err.message } };
   }
   if (err instanceof RejectedError) {
@@ -274,6 +305,15 @@ function toJobError(err: unknown): { status: number; body: JobError } {
   }
   if (err instanceof TooLargeError) {
     return { status: err.status, body: { code: err.code, error: err.message } };
+  }
+  // Download-cap abort in audio-cut carries { status: 413, code: "too_large" }.
+  if (
+    typeof (err as { code?: unknown }).code === "string" &&
+    (err as { code?: string }).code === "too_large" &&
+    (err as { status?: unknown }).status === 413
+  ) {
+    const message = err instanceof Error ? err.message.slice(0, 500) : "Audio exceeds 100MB limit";
+    return { status: 413, body: { code: "too_large", error: message } };
   }
   if (err instanceof TimeoutError) {
     return { status: err.status, body: { code: err.code, error: err.message } };
@@ -393,6 +433,7 @@ async function runExtraction(
 
     const result: JobResult = {
       kind,
+      source: "youtube",
       audio_url: url,
       ...(kind === "video" ? { video_url: url } : {}),
       r2Key,
@@ -419,6 +460,115 @@ async function runExtraction(
     return result;
   } finally {
     // Cleanup /tmp always (job record stays in Map for 1h of polling)
+    try {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+      logger.debug(`[job ${jobId}] tmp cleaned dir=${tmpDir}`);
+    } catch (err) {
+      logger.warn(`[job ${jobId}] tmp cleanup failed dir=${tmpDir} err=${String(err).slice(0, 150)}`);
+    }
+  }
+}
+
+/**
+ * Audio-cut core: download a hosted audio file -> exact ffmpeg cut ->
+ * verify -> R2. Cleans its tmp dir. Mirrors the trim verification in
+ * runExtraction: never silently upload the wrong file.
+ */
+async function runAudioCut(
+  jobId: string,
+  audioUrl: string,
+  title_hint: string | undefined,
+  range: ParsedRange
+): Promise<JobResult> {
+  const jobStarted = Date.now();
+  const trimming = range.startSeconds > 0 || range.endSeconds !== null;
+  const tmpDir = path.join(os.tmpdir(), `cut-${jobId}`);
+  await fs.mkdir(tmpDir, { recursive: true });
+  logger.debug(`[job ${jobId}] audio-cut tmp ready dir=${tmpDir} trimming=${trimming}`);
+  try {
+    const tDl = Date.now();
+    const downloaded = await downloadAudioToFile(audioUrl, tmpDir);
+    logger.debug(`[job ${jobId}] stage=download elapsedMs=${Date.now() - tDl} sizeBytes=${downloaded.sizeBytes}`);
+
+    const tProbe = Date.now();
+    const fullInfo = await getMediaInfo(downloaded.filepath);
+    logger.debug(
+      `[job ${jobId}] stage=probe elapsedMs=${Date.now() - tProbe} durationSeconds=${fullInfo.durationSeconds}`
+    );
+    assertRangeWithinDuration(range, fullInfo.durationSeconds, "audio-cut");
+
+    let cutPath = downloaded.filepath;
+    if (trimming) {
+      const outPath = path.join(tmpDir, `cut-${Date.now()}.mp3`);
+      const tCut = Date.now();
+      await cutMp3(downloaded.filepath, outPath, range.startSeconds, range.endSeconds);
+      logger.debug(`[job ${jobId}] stage=cut elapsedMs=${Date.now() - tCut} out=${outPath}`);
+      cutPath = outPath;
+    }
+
+    // Verify the cut: probed duration must match the requested section (±5s).
+    const tVerify = Date.now();
+    const info = await getMediaInfo(cutPath);
+    logger.debug(
+      `[job ${jobId}] stage=verify elapsedMs=${Date.now() - tVerify} sizeBytes=${info.sizeBytes} durationSeconds=${info.durationSeconds}`
+    );
+    if (info.sizeBytes > MAX_FILE_BYTES) {
+      throw new TooLargeError(`Audio is ${(info.sizeBytes / 1024 / 1024).toFixed(1)}MB, exceeds 100MB limit`);
+    }
+    if (info.sizeBytes < 10_000) {
+      throw new Error(`Cut file suspiciously small (${info.sizeBytes} bytes) — likely failed cut`);
+    }
+    const expectedTrimmed =
+      range.endSeconds !== null
+        ? range.endSeconds - range.startSeconds
+        : fullInfo.durationSeconds != null
+          ? fullInfo.durationSeconds - range.startSeconds
+          : null;
+    if (trimming && expectedTrimmed !== null && info.durationSeconds != null) {
+      const drift = Math.abs(info.durationSeconds - expectedTrimmed);
+      logger.debug(
+        `[job ${jobId}] stage=trim-check probed=${info.durationSeconds} expected=${expectedTrimmed} drift=${drift}`
+      );
+      if (drift > 5) {
+        throw new Error(
+          `Cut audio is ${Math.round(info.durationSeconds)}s but expected ${Math.round(expectedTrimmed)}s (±5s) ` +
+            `for range ${range.startSeconds}s-${range.endSeconds !== null ? `${range.endSeconds}s` : "end"} — refusing to upload`
+        );
+      }
+    }
+
+    const slugBase = (title_hint && title_hint.trim()) || "oneielts-audio";
+    const filename = buildAudioCutFilename(slugBase, Date.now());
+    logger.debug(`[job ${jobId}] stage=filename file=${filename}`);
+
+    const tUpload = Date.now();
+    const { r2Key, url } = await uploadToR2(cutPath, filename, "audio", "practice");
+    logger.debug(`[job ${jobId}] stage=upload elapsedMs=${Date.now() - tUpload} r2Key=${r2Key}`);
+
+    const result: JobResult = {
+      kind: "audio",
+      source: "audio-cut",
+      audio_url: url,
+      r2Key,
+      youtube_id: "audio-cut",
+      title: slugBase.trim().slice(0, 200) || "oneielts-audio",
+      duration_seconds:
+        info.durationSeconds != null
+          ? Math.round(info.durationSeconds)
+          : trimming && expectedTrimmed != null
+            ? Math.round(expectedTrimmed)
+            : fullInfo.durationSeconds != null
+              ? Math.round(fullInfo.durationSeconds)
+              : null,
+      size: info.sizeBytes,
+      trimmed: trimming,
+      start_seconds: trimming ? range.startSeconds : null,
+      end_seconds: trimming ? range.endSeconds : null,
+      original_duration_seconds: fullInfo.durationSeconds != null ? Math.round(fullInfo.durationSeconds) : null,
+    };
+    logger.debug(`[job ${jobId}] stage=result totalElapsedMs=${Date.now() - jobStarted} size=${result.size}`);
+    return result;
+  } finally {
     try {
       await fs.rm(tmpDir, { recursive: true, force: true });
       logger.debug(`[job ${jobId}] tmp cleaned dir=${tmpDir}`);
@@ -535,6 +685,7 @@ app.post("/extract", authMiddleware, async (req, res) => {
     status: "queued",
     createdAt: Date.now(),
     youtube_id: videoId,
+    source: "youtube",
     title_hint,
     kind,
   };
@@ -584,9 +735,115 @@ app.get("/job/:id", authMiddleware, (req, res) => {
     status: job.status,
     youtube_id: job.youtube_id,
     kind: job.kind,
+    ...(job.source ? { source: job.source } : {}),
+    ...(job.audio_url ? { audio_url: job.audio_url } : {}),
     ...(job.result ? { result: job.result } : {}),
     ...(job.error ? { error: job.error } : {}),
   });
+});
+
+// --- POST /audio-cut: generic hosted-audio cutter (OneIELTS CDN, R2, …) ---
+// Separate from /extract: no YouTube involved. Same async job pattern:
+// 202 { jobId } -> poll GET /job/:id until done/failed; ?wait=true for sync.
+app.post("/audio-cut", authMiddleware, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  const parsed = AudioCutBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      success: false,
+      code: "invalid_url",
+      error: "Body must be { audio_url: string, start_time?: seconds|mm:ss|hh:mm:ss, end_time?: ..., title_hint?: string }",
+      details: parsed.error.issues.map((i) => ({ path: i.path, message: i.message })).slice(0, 5),
+    });
+    return;
+  }
+  const { audio_url, title_hint } = parsed.data;
+  let range: ParsedRange;
+  try {
+    range = parseTimeRange(parsed.data.start_time, parsed.data.end_time);
+  } catch (err) {
+    if (err instanceof InvalidRangeError) {
+      logger.debug(`[audio-cut] reject range: ${err.message}`);
+      res.status(err.status).json({ success: false, code: err.code, error: err.message });
+      return;
+    }
+    throw err;
+  }
+  // Validate the URL (incl. DNS/SSRF guard) before admitting a queue slot.
+  try {
+    await validateAudioUrl(audio_url);
+  } catch (err) {
+    if (err instanceof InvalidAudioUrlError) {
+      logger.debug(`[audio-cut] reject url: ${err.message}`);
+      res.status(err.status).json({ success: false, code: err.code, error: err.message });
+      return;
+    }
+    throw err;
+  }
+  const wait = req.query.wait === "true";
+  logger.debug(`[audio-cut] mode=${wait ? "sync(wait=true)" : "async"} url host=${safeHost(audio_url)} hint=${title_hint ? "yes" : "no"}`);
+
+  if (wait) {
+    const jobId = uuidv4();
+    logger.info(`[job ${jobId}] audio-cut sync start host=${safeHost(audio_url)}`);
+    const p = tryRun(() => runAudioCut(jobId, audio_url, title_hint, range));
+    if (!p) {
+      logger.debug(`[job ${jobId}] audio-cut sync reject busy`);
+      res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
+      return;
+    }
+    try {
+      const result = await p;
+      res.setHeader("Cache-Control", "no-store");
+      res.json({ success: true, ...result });
+      logger.info(`[job ${jobId}] audio-cut sync done -> ${result.r2Key} (${result.size} bytes)`);
+    } catch (err) {
+      const mapped = toJobError(err);
+      logger.debug(`[job ${jobId}] audio-cut sync error code=${mapped.body.code} status=${mapped.status}`);
+      if (mapped.status >= 500) logger.error(`[job ${jobId}] audio-cut sync failed:`, mapped.body.error.slice(0, 300));
+      res.status(mapped.status).json({ success: false, ...mapped.body });
+    }
+    return;
+  }
+
+  const job: Job = {
+    id: uuidv4(),
+    status: "queued",
+    createdAt: Date.now(),
+    youtube_id: "audio-cut",
+    source: "audio-cut",
+    audio_url,
+    title_hint,
+    kind: "audio",
+  };
+  const p = tryRun(async () => {
+    job.status = "running";
+    logger.info(`[job ${job.id}] audio-cut start host=${safeHost(audio_url)}`);
+    try {
+      const result = await runAudioCut(job.id, audio_url, title_hint, range);
+      job.status = "done";
+      job.result = result;
+      logger.info(`[job ${job.id}] audio-cut done -> ${result.r2Key} (${result.size} bytes)`);
+    } catch (err) {
+      const mapped = toJobError(err);
+      job.status = "failed";
+      job.error = mapped.body;
+      logger.debug(`[job ${job.id}] audio-cut error code=${mapped.body.code} status=${mapped.status}`);
+      if (mapped.status >= 500) logger.error(`[job ${job.id}] audio-cut failed:`, mapped.body.error.slice(0, 300));
+      else logger.info(`[job ${job.id}] audio-cut failed: ${mapped.body.code}`);
+    }
+  });
+  if (!p) {
+    logger.debug(`[audio-cut] async reject busy`);
+    res.status(429).json({ success: false, code: "busy_retry", error: "Server busy (2 concurrent jobs). Retry shortly." });
+    return;
+  }
+  jobs.set(job.id, job);
+  scheduleJobCleanup(job.id);
+  p.catch(() => undefined);
+  logger.debug(`[job ${job.id}] accepted audio-cut status=${job.status}`);
+  res.status(202).json({ success: true, jobId: job.id, status: job.status });
 });
 
 async function main(): Promise<void> {

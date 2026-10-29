@@ -40,7 +40,7 @@ export function publicUrlForKey(key: string): string {
 }
 
 /**
- * Upload a local media file (mp3 or mp4) to R2 under predictions/{filename}.
+ * Upload a local media file (mp3 or mp4) to R2 under {prefix}/{filename}.
  * Streams the file (never buffers 100MB+ in RAM — safe on medium-1x).
  * Stat-checked before upload so oversize files fail fast with 413.
  * Returns { r2Key, url }.
@@ -48,7 +48,8 @@ export function publicUrlForKey(key: string): string {
 export async function uploadToR2(
   localPath: string,
   filename: string,
-  kind: MediaKind = "audio"
+  kind: MediaKind = "audio",
+  prefix = "predictions"
 ): Promise<{ r2Key: string; url: string }> {
   const capBytes = kind === "video" ? MAX_VIDEO_FILE_BYTES : MAX_FILE_BYTES;
   const capMb = Math.round(capBytes / 1024 / 1024);
@@ -60,7 +61,8 @@ export async function uploadToR2(
     );
   }
   const bucket = getBucket();
-  const key = `predictions/${path.basename(filename)}`;
+  const cleanPrefix = (prefix || "predictions").replace(/^\/+|\/+$/g, "") || "predictions";
+  const key = `${cleanPrefix}/${path.basename(filename)}`;
   const s3 = getS3Client();
   // Stream: constant memory regardless of file size (10-300MB).
   const started = Date.now();

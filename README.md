@@ -255,6 +255,62 @@ done; wait
 # (automated equivalent: npm test — queue.test.ts asserts 2 run / 3 rejected)
 ```
 
+### `POST /audio-cut`
+
+Generic hosted-audio cutter for OneIELTS (and any public mp3) — **separate
+from `/extract`, no YouTube involved**. The caller already knows the source
+file URL (OneIELTS CDN, R2, …) and the desired range:
+
+```bash
+# submit -> 202 {jobId}, poll GET /job/:id until done/failed (same as /extract)
+curl -s -X POST https://<app-url>/audio-cut \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"audio_url":"https://.../listening-test.mp3","start_time":30,"end_time":"8:24","title_hint":"oneielts-1444-map"}'
+# done: {"success":true,...,"result":{"audio_url":"https://pub-xxx.r2.dev/practice/...-onecut-....mp3",...}}
+
+# local-dev sync
+curl -s -m 180 -X POST 'https://<app-url>/audio-cut?wait=true' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"audio_url":"https://.../listening-test.mp3","start_time":30,"end_time":"8:24"}'
+```
+
+Body:
+
+```json
+{
+  "audio_url": "https://.../listening-test.mp3",
+  "title_hint": "optional-slug",
+  "start_time": "1:00",
+  "end_time": "8:24"
+}
+```
+
+Same range format as `/extract` (`start_time`/`end_time` optional;
+defaults = full file, i.e. plain proxy+upload). Pipeline:
+
+1. URL validated up front (http/https only, no credentials, lexical +
+   DNS check against private/loopback/link-local targets — SSRF guard).
+   Full audio URLs may carry signed query params, so logs record the
+   host only, never the full URL.
+2. Stream-download with 120s timeout and 100MB cap (aborts + 413
+   `too_large` on oversize).
+3. `ffprobe` full duration; range checked against it (`invalid_range`
+   when outside, same as `/extract`).
+4. Exact cut via ffmpeg re-encode (`libmp3lame` 128k, output seeking —
+   sample-accurate, no frame-boundary drift), verified with `ffprobe`
+   against the requested section (±5s, refuses to upload on mismatch).
+5. R2 upload under `practice/{slug}-onecut-{Date.now()}.mp3`
+   (`ContentType: audio/mpeg`) → public URL. Tmp dir cleaned always.
+
+No new env vars: detection (Deepgram transcription + LLM range inference)
+lives in the web app, which already holds those keys. This service stays a
+stateless cutter.
+
+Error codes: same table as `/extract` (`unauthorized`, `invalid_url` for
+bad/unresolvable/private audio URLs, `invalid_range`, `too_large`,
+`busy_retry`, `not_found`, `extract_failed` for download/cut/upload
+failures).
+
 ### `GET /job/:id`
 
 Auth required. Returns `{status: queued|running|done|failed, result|error}`.
